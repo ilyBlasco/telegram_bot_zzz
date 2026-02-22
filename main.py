@@ -406,8 +406,6 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If last action was an ADD: subtract it
     if last_kind == "add":
-        # Ensure we are operating in the correct session context
-        # If state session is ahead (shouldn't happen unless something weird), clamp back
         if st["session_id"] != last_session:
             set_session_id(chat_id, last_session)
 
@@ -434,15 +432,12 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If last action was a RELEASE: restore that released total and restore session
     if last_kind == "release":
-        # After release, the bot increments session_id and total is 0.
-        # Restore previous session and total from the release amount.
         restored_total = last_amount
         restored_session = last_session
 
         set_session_id(chat_id, restored_session)
         set_total(chat_id, restored_total)
 
-        # Remove the release record and the release movement itself (Ctrl+Z removes the last transaction)
         delete_latest_release_for_session(chat_id, restored_session)
         delete_movement(int(last["id"]))
 
@@ -459,7 +454,6 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_panel(update, context, text=build_panel_text(restored_total), reply_markup=build_panel_keyboard())
         return
 
-    # Unknown kind safeguard
     await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
 
 
@@ -521,16 +515,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "release":
         actor_id = update.effective_user.id
 
+        # CHANGE #1: don't refresh panel / don't create new session if total is 0
         if total_cents <= 0:
-            set_total(chat_id, 0)
-            await edit_panel(update, context, text=build_panel_text(0), reply_markup=build_panel_keyboard())
-            set_panel_message_id(chat_id, query.message.message_id)
+            await notify(
+                context,
+                "La cantidad que intentas retirar es <b>$0.00</b> (coincidentemente, no hay nada que hacer).",
+            )
             return
 
         fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
         released_at = now_utc_iso()
 
-        # Record release
         with db() as conn:
             conn.execute(
                 """
@@ -540,7 +535,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (chat_id, session_id, total_cents, fee_cents, network_fee_cents, net_cents, actor_id, released_at),
             )
 
-        # Log movement release (amount = released_total)
         log_movement(chat_id, session_id, "release", total_cents, 0, actor_id)
 
         await notify(
@@ -555,7 +549,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-        # Reset total and advance session (history resets for new session)
         set_total(chat_id, 0)
         set_session_id(chat_id, session_id + 1)
         AWAITING_CUSTOM_AMOUNT.discard(actor_id)
@@ -577,7 +570,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "history":
-        # Show history for current session
         st = get_state(chat_id)
         session_id = st["session_id"]
 
@@ -596,9 +588,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía."
         else:
+            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             lines = ["<b>📜 History (sesión actual)</b>", ""]
             for r in rows:
-                ts = r["created_at"].replace("T", " ").split(".")[0].replace("+00:00", " UTC")
+                # CHANGE #2: show date only (no hour)
+                dt_utc = datetime.fromisoformat(r["created_at"])
+                ts = f"{dt_utc.day:02d} {months[dt_utc.month - 1]} {dt_utc.year}"
+
                 kind = r["kind"]
                 label = "Add" if kind == "add" else ("Release" if kind == "release" else kind)
                 lines.append(
@@ -634,7 +630,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         add_cents = money_to_cents(text)
     except Exception:
-        # Delete invalid input too
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
         except Exception:
@@ -644,18 +639,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Número inválido. Envía algo como <code>420</code> o <code>420.50</code>.",
             parse_mode=ParseMode.HTML,
         )
-        # auto-delete error message too (use same env var)
         context.application.create_task(delete_later(context, chat_id, msg.message_id, NOTIFY_DELETE_SECONDS))
         return
 
-    # Remove waiting state
     AWAITING_CUSTOM_AMOUNT.discard(user_id)
 
     st = get_state(chat_id)
     total_cents = st["total_cents"] + add_cents
     set_total(chat_id, total_cents)
 
-    # Log movement
     session_id = st["session_id"]
     log_movement(chat_id, session_id, "add", add_cents, total_cents, user_id)
 
@@ -668,13 +660,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
     )
 
-    # Delete user's message to prevent spam
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
     except Exception:
         pass
 
-    # Update panel in place
     await edit_panel(update, context, text=build_panel_text(total_cents), reply_markup=build_panel_keyboard())
 
 
