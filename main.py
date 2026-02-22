@@ -15,6 +15,10 @@ from telegram.ext import (
     filters,
 )
 
+# =========================
+# CONFIG
+# =========================
+
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
@@ -34,6 +38,10 @@ CONFIRM_WINDOW_SECONDS = 24 * 60 * 60
 # Per-user "waiting for custom amount" state (in-memory OK for one worker)
 AWAITING_CUSTOM_AMOUNT: set[int] = set()
 
+
+# =========================
+# DB HELPERS
+# =========================
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -128,6 +136,10 @@ def init_db():
         )
 
 
+# =========================
+# TIME / MONEY
+# =========================
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -137,7 +149,6 @@ def now_utc_iso() -> str:
 
 
 def iso_to_dt(s: str) -> datetime:
-    # stored as ISO with timezone
     return datetime.fromisoformat(s)
 
 
@@ -178,6 +189,10 @@ def compute_fee_net(total_cents: int) -> tuple[int, int, int]:
     return fee_cents, network_fee_cents, net_cents
 
 
+# =========================
+# GLOBAL STATE
+# =========================
+
 def get_global_state() -> dict:
     with db() as conn:
         row = conn.execute("SELECT total_cents, session_id FROM global_state WHERE id = 1").fetchone()
@@ -193,6 +208,10 @@ def set_global_session(session_id: int):
     with db() as conn:
         conn.execute("UPDATE global_state SET session_id = ? WHERE id = 1", (session_id,))
 
+
+# =========================
+# CHAT STATE (PANEL MESSAGE)
+# =========================
 
 def get_chat_state(chat_id: int) -> dict:
     with db() as conn:
@@ -215,6 +234,10 @@ def set_panel_mode(chat_id: int, mode: str):
     with db() as conn:
         conn.execute("UPDATE chat_state SET panel_mode = ? WHERE chat_id = ?", (mode, chat_id))
 
+
+# =========================
+# PARTICIPANTS
+# =========================
 
 def participant_count() -> int:
     with db() as conn:
@@ -261,6 +284,10 @@ def get_confirmer_id() -> int | None:
         return int(row["user_id"]) if row else None
 
 
+# =========================
+# CONFIRMATIONS
+# =========================
+
 def pending_confirmations_count() -> int:
     now = now_utc_iso()
     with db() as conn:
@@ -273,234 +300,6 @@ def pending_confirmations_count() -> int:
             (now,),
         ).fetchone()
         return int(row["c"])
-
-
-async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, seconds: int):
-    try:
-        await asyncio.sleep(seconds)
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
-
-
-async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
-    # Best-effort notifications; never crash the bot if notification fails
-    for uid in get_participants():
-        try:
-            msg = await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
-            context.application.create_task(delete_later(context, uid, msg.message_id, NOTIFY_DELETE_SECONDS))
-        except Exception:
-            pass
-
-
-def build_panel_text(total_cents: int) -> str:
-    fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
-
-    pending = pending_confirmations_count()
-    pending_block = ""
-    if pending > 0:
-        pending_block = (
-            f"\n危 {pending} movimientos no confirmados 危\n"
-            "(se autoconfirman en 24h)\n"
-        )
-
-    return (
-        "光 ═════════════ 光\n\n"
-        f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
-        f"<b>費 Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
-        f"<b>費 Network fee</b> :: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
-        f"💵 <b>NET</b>   :: <code>${cents_to_money_str(net_cents)}</code>\n"
-        f"{pending_block}\n"
-        "<b>(ZELLE CAPTURE ONLY)</b>\n\n"
-        f"<i>⏳ Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s</i>"
-    )
-
-
-def build_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("+10", callback_data="add:10"),
-                InlineKeyboardButton("+50", callback_data="add:50"),
-                InlineKeyboardButton("+100", callback_data="add:100"),
-            ],
-            [
-                InlineKeyboardButton("✍ Custom", callback_data="custom"),
-            ],
-            [
-                InlineKeyboardButton("📜 History", callback_data="history"),
-                InlineKeyboardButton("⏪ Control + Z", callback_data="undo"),
-            ],
-            [
-                InlineKeyboardButton("解Release除", callback_data="release"),
-            ],
-        ]
-    )
-
-
-def build_back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="back")]])
-
-
-def build_back_to_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Volver al panel", callback_data="back")]])
-
-
-def build_confirm_keyboard(movement_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{movement_id}")]]
-    )
-
-
-async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup):
-    """
-    Edita el panel en modo texto o banner (foto + caption).
-    Se auto-recupera si el modo guardado no coincide con el tipo real de mensaje.
-    """
-    st = get_chat_state(chat_id)
-    panel_message_id = st.get("panel_message_id")
-
-    if not panel_message_id:
-        await send_or_update_panel(chat_id, context)
-        return
-
-    mode = st.get("panel_mode", "text")
-    if mode == "banner" and BANNER_URL:
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=chat_id,
-                message_id=panel_message_id,
-                caption=text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except Exception:
-            set_panel_mode(chat_id, "text")
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=panel_message_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    except Exception:
-        if BANNER_URL:
-            try:
-                await context.bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=panel_message_id,
-                    caption=text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.HTML,
-                )
-                set_panel_mode(chat_id, "banner")
-                return
-            except Exception:
-                pass
-
-    set_panel_message_id(chat_id, None)
-    await send_or_update_panel(chat_id, context)
-
-
-async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    chat_st = get_chat_state(chat_id)
-
-    g = get_global_state()
-    total_cents = g["total_cents"]
-
-    text = build_panel_text(total_cents)
-    kb = build_panel_keyboard()
-    panel_message_id = chat_st.get("panel_message_id")
-
-    if panel_message_id:
-        try:
-            await edit_panel(chat_id, context, text=text, reply_markup=kb)
-            return
-        except Exception:
-            pass
-
-    if BANNER_URL:
-        try:
-            msg = await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=BANNER_URL,
-                caption=text,
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-            )
-            set_panel_mode(chat_id, "banner")
-            set_panel_message_id(chat_id, msg.message_id)
-            return
-        except Exception:
-            set_panel_mode(chat_id, "text")
-
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-    )
-    set_panel_message_id(chat_id, msg.message_id)
-
-
-async def update_all_panels(context: ContextTypes.DEFAULT_TYPE):
-    # Each participant has their own chat_id (private chat)
-    for uid in get_participants():
-        try:
-            await send_or_update_panel(uid, context)
-        except Exception:
-            pass
-
-
-def log_movement(kind: str, amount_cents: int, total_after_cents: int, actor_id: int) -> int:
-    g = get_global_state()
-    session_id = g["session_id"]
-    with db() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO movements(session_id, kind, amount_cents, total_after_cents, actor_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (session_id, kind, amount_cents, total_after_cents, actor_id, now_utc_iso()),
-        )
-        return int(cur.lastrowid)
-
-
-def get_last_movement() -> sqlite3.Row | None:
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT id, session_id, kind, amount_cents, total_after_cents, actor_id, created_at
-            FROM movements
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        return row
-
-
-def delete_movement(movement_id: int):
-    with db() as conn:
-        conn.execute("DELETE FROM movements WHERE id = ?", (movement_id,))
-
-
-def delete_latest_release_for_session(session_id: int):
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT id FROM releases
-            WHERE session_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (session_id,),
-        ).fetchone()
-        if row:
-            conn.execute("DELETE FROM releases WHERE id = ?", (row["id"],))
 
 
 def create_confirmation_for_movement(movement_id: int, actor_id: int, amount_cents: int) -> None:
@@ -586,11 +385,266 @@ async def cleanup_expired_confirmations(context: ContextTypes.DEFAULT_TYPE):
 
     for r in rows:
         mid = int(r["movement_id"])
-        # Mark confirmed (auto)
         mark_confirmed(mid, confirmed_by=0)
-        # Delete confirm message (best-effort)
         await try_delete_confirm_message(context, mid)
 
+
+# =========================
+# MOVEMENTS / RELEASES
+# =========================
+
+def log_movement(kind: str, amount_cents: int, total_after_cents: int, actor_id: int) -> int:
+    g = get_global_state()
+    session_id = g["session_id"]
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO movements(session_id, kind, amount_cents, total_after_cents, actor_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, kind, amount_cents, total_after_cents, actor_id, now_utc_iso()),
+        )
+        return int(cur.lastrowid)
+
+
+def get_last_movement() -> sqlite3.Row | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, session_id, kind, amount_cents, total_after_cents, actor_id, created_at
+            FROM movements
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return row
+
+
+def delete_movement(movement_id: int):
+    with db() as conn:
+        conn.execute("DELETE FROM movements WHERE id = ?", (movement_id,))
+
+
+def delete_latest_release_for_session(session_id: int):
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM releases
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM releases WHERE id = ?", (row["id"],))
+
+
+# =========================
+# UI BUILDERS
+# =========================
+
+def build_panel_text(total_cents: int) -> str:
+    fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
+
+    pending = pending_confirmations_count()
+    pending_block = ""
+    if pending > 0:
+        pending_block = (
+            f"\n危 {pending} movimientos no confirmados 危\n"
+            "(se autoconfirman en 24h)\n"
+        )
+
+    return (
+        "光 ═════════════ 光\n\n"
+        f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
+        f"<b>費 Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
+        f"<b>費 Network fee</b> :: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
+        f"💵 <b>NET</b>   :: <code>${cents_to_money_str(net_cents)}</code>\n"
+        f"{pending_block}\n"
+        "<b>(ZELLE CAPTURE ONLY)</b>\n\n"
+        f"<i>⏳ Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s</i>"
+    )
+
+
+def build_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("+10", callback_data="add:10"),
+                InlineKeyboardButton("+50", callback_data="add:50"),
+                InlineKeyboardButton("+100", callback_data="add:100"),
+            ],
+            [
+                InlineKeyboardButton("✍ Custom", callback_data="custom"),
+            ],
+            [
+                InlineKeyboardButton("📜 History", callback_data="history"),
+                InlineKeyboardButton("⏪ Control + Z", callback_data="undo"),
+            ],
+            [
+                InlineKeyboardButton("解Release除", callback_data="release"),
+            ],
+        ]
+    )
+
+
+def build_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="back")]])
+
+
+def build_back_to_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Volver al panel", callback_data="back")]])
+
+
+def build_confirm_keyboard(movement_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Confirm", callback_data=f"confirm:{movement_id}")]]
+    )
+
+
+# =========================
+# DELETE HELPERS / NOTIFY
+# =========================
+
+async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, seconds: int):
+    try:
+        await asyncio.sleep(seconds)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
+    # Best-effort notifications; never crash the bot if notification fails
+    for uid in get_participants():
+        try:
+            msg = await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
+            context.application.create_task(delete_later(context, uid, msg.message_id, NOTIFY_DELETE_SECONDS))
+        except Exception:
+            pass
+
+
+# =========================
+# PANEL RENDERING (FIXES DUPLICATION)
+# =========================
+# Core rule:
+# - For a chat_id, we keep exactly ONE panel_message_id.
+# - If edit fails, we attempt to delete the old message (best-effort) and create a new one, updating the stored id.
+# This prevents "duplicate dashboards".
+
+async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup):
+    st = get_chat_state(chat_id)
+    panel_message_id = st.get("panel_message_id")
+
+    if not panel_message_id:
+        await send_or_update_panel(chat_id, context)
+        return
+
+    mode = st.get("panel_mode", "text")
+
+    # Try banner caption edit if we believe it's banner
+    if mode == "banner" and BANNER_URL:
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=panel_message_id,
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            set_panel_mode(chat_id, "text")
+
+    # Try text edit
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=panel_message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception:
+        # maybe it's actually a banner; try caption edit
+        if BANNER_URL:
+            try:
+                await context.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=panel_message_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                set_panel_mode(chat_id, "banner")
+                return
+            except Exception:
+                pass
+
+    # If we get here, editing failed. To prevent duplicates:
+    # best-effort delete old panel message, then create a fresh one and store its id.
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+    except Exception:
+        pass
+
+    set_panel_message_id(chat_id, None)
+    await send_or_update_panel(chat_id, context)
+
+
+async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    st = get_chat_state(chat_id)
+    g = get_global_state()
+    total_cents = g["total_cents"]
+
+    text = build_panel_text(total_cents)
+    kb = build_panel_keyboard()
+
+    panel_message_id = st.get("panel_message_id")
+    if panel_message_id:
+        # Try edit; if it fails, edit_panel will delete & recreate
+        await edit_panel(chat_id, context, text=text, reply_markup=kb)
+        return
+
+    # Create new panel: banner if configured, otherwise text
+    if BANNER_URL:
+        try:
+            msg = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=BANNER_URL,
+                caption=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+            set_panel_mode(chat_id, "banner")
+            set_panel_message_id(chat_id, msg.message_id)
+            return
+        except Exception:
+            set_panel_mode(chat_id, "text")
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+    set_panel_message_id(chat_id, msg.message_id)
+
+
+async def update_all_panels(context: ContextTypes.DEFAULT_TYPE):
+    # Update or create exactly one panel per participant
+    for uid in get_participants():
+        try:
+            await send_or_update_panel(uid, context)
+        except Exception:
+            pass
+
+
+# =========================
+# CONFIRMATION MESSAGES
+# =========================
 
 async def send_confirmation_request_to_confirmer(
     context: ContextTypes.DEFAULT_TYPE,
@@ -602,7 +656,6 @@ async def send_confirmation_request_to_confirmer(
     if not confirmer_id:
         return
 
-    # Only send to confirmer (you)
     try:
         msg = await context.bot.send_message(
             chat_id=confirmer_id,
@@ -615,14 +668,17 @@ async def send_confirmation_request_to_confirmer(
             reply_markup=build_confirm_keyboard(movement_id),
             parse_mode=ParseMode.HTML,
         )
-        # Store message refs so we can delete on confirm/expiry
         set_confirm_message_refs(movement_id, confirmer_id, msg.message_id)
 
-        # Also schedule deletion at 24h best-effort (restart-safe because we also cleanup on interaction)
+        # best-effort delete at 24h (also cleaned on interactions)
         context.application.create_task(delete_later(context, confirmer_id, msg.message_id, CONFIRM_WINDOW_SECONDS))
     except Exception:
         pass
 
+
+# =========================
+# UNDO
+# =========================
 
 async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_expired_confirmations(context)
@@ -641,7 +697,6 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_total = g["total_cents"]
     current_session = g["session_id"]
 
-    # If last action was ADD: subtract it + remove confirmation (and confirm message)
     if last_kind == "add":
         if current_session != last_session:
             set_global_session(last_session)
@@ -671,7 +726,6 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_all_panels(context)
         return
 
-    # If last action was RELEASE: restore that released total and restore session
     if last_kind == "release":
         restored_total = last_amount
         restored_session = last_session
@@ -698,6 +752,10 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
 
 
+# =========================
+# START
+# =========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -711,22 +769,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.application.create_task(delete_later(context, update.effective_chat.id, msg.message_id, 10))
         return
 
-    # Make sure this user's panel exists/updates
+    # IMPORTANT FIX: create/update only THIS user's panel first (no duplicates),
+    # then update others (edit existing or create if missing).
     await send_or_update_panel(update.effective_chat.id, context)
-
-    # Also refresh everybody (so both always see the same global totals)
     await update_all_panels(context)
 
 
+# =========================
+# BUTTON HANDLER
+# =========================
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    # IMPORTANT FIX: Always answer query ASAP to avoid the "loading spinner forever",
+    # even if we later reject due to permissions.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     user = update.effective_user
     if not user or not is_participant(user.id):
         return
 
     await cleanup_expired_confirmations(context)
-
-    query = update.callback_query
-    await query.answer()
 
     data = query.data or ""
 
@@ -740,10 +807,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         movement_id = log_movement("add", add_cents, total_cents, user.id)
 
-        # Create confirmation (unconfirmed)
         create_confirmation_for_movement(movement_id, user.id, add_cents)
 
-        # Notifications (auto-delete normal)
         await notify(
             context,
             (
@@ -753,7 +818,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-        # Confirmation request only to confirmer (24h)
         await send_confirmation_request_to_confirmer(
             context=context,
             movement_id=movement_id,
@@ -762,12 +826,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await update_all_panels(context)
-        set_panel_message_id(update.effective_chat.id, query.message.message_id)
         return
 
     if data == "custom":
         AWAITING_CUSTOM_AMOUNT.add(user.id)
-        set_panel_message_id(update.effective_chat.id, query.message.message_id)
 
         await edit_panel(
             update.effective_chat.id,
@@ -786,7 +848,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("confirm:"):
-        # Only confirmer can confirm
         confirmer_id = get_confirmer_id()
         if not confirmer_id or user.id != confirmer_id:
             return
@@ -798,28 +859,25 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         row = get_confirmation(movement_id)
         if not row:
-            # already undone/deleted
             try:
                 await query.edit_message_text("Confirmación ya no existe.", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
+            await update_all_panels(context)
             return
 
         if int(row["is_confirmed"]) == 1:
-            # already confirmed
             await try_delete_confirm_message(context, movement_id)
+            await update_all_panels(context)
             return
 
-        # Confirm it
         mark_confirmed(movement_id, confirmed_by=user.id)
-
-        # Delete confirm message instantly
         await try_delete_confirm_message(context, movement_id)
 
         amount_cents = int(row["amount_cents"])
         actor_id = int(row["actor_id"])
 
-        # Notify the actor (Yozu) that Blasco confirmed (auto-delete normal)
+        # Notify actor (auto-delete normal)
         if actor_id != user.id:
             try:
                 msg = await context.bot.send_message(
@@ -843,7 +901,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_id = g["session_id"]
 
         if total_cents <= 0:
-            await notify(context, "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.")
+            # Non-toxic, stable behavior: do nothing besides notifying
+            await notify(
+                context,
+                "La cantidad que intentas retirar es <b>$0.00</b>. No hay nada que retirar.",
+            )
+            await update_all_panels(context)
             return
 
         fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
@@ -875,6 +938,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_global_session(session_id + 1)
         AWAITING_CUSTOM_AMOUNT.discard(user.id)
 
+        # Show release summary in the current chat panel momentarily, then back
         await edit_panel(
             update.effective_chat.id,
             context,
@@ -888,9 +952,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             reply_markup=build_back_to_panel_keyboard(),
         )
-        set_panel_message_id(update.effective_chat.id, query.message.message_id)
 
-        # Refresh all panels too
         await update_all_panels(context)
         return
 
@@ -911,7 +973,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
 
         if not rows:
-            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro."
+            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía."
         else:
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             lines = ["<b>📜 History (sesión actual)</b>", ""]
@@ -929,16 +991,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hist_text = "\n".join(lines)
 
         await edit_panel(update.effective_chat.id, context, text=hist_text, reply_markup=build_back_keyboard())
-        set_panel_message_id(update.effective_chat.id, query.message.message_id)
         return
 
     if data == "back":
         g = get_global_state()
         total_cents = g["total_cents"]
-        await edit_panel(update.effective_chat.id, context, text=build_panel_text(total_cents), reply_markup=build_panel_keyboard())
-        set_panel_message_id(update.effective_chat.id, query.message.message_id)
+        await edit_panel(
+            update.effective_chat.id,
+            context,
+            text=build_panel_text(total_cents),
+            reply_markup=build_panel_keyboard(),
+        )
         return
 
+
+# =========================
+# MESSAGE HANDLER (CUSTOM AMOUNT)
+# =========================
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -962,7 +1031,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         msg = await update.effective_chat.send_message(
-            "Número inválido. Envía algo como <code>420</code> o <code>420.50</code>, Sin letras ni símbolos.",
+            "Número inválido. Envía algo como <code>420</code> o <code>420.50</code>, sin letras ni símbolos.",
             parse_mode=ParseMode.HTML,
         )
         context.application.create_task(delete_later(context, chat_id, msg.message_id, NOTIFY_DELETE_SECONDS))
@@ -976,7 +1045,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     movement_id = log_movement("add", add_cents, total_cents, user.id)
 
-    # Create confirmation (unconfirmed)
     create_confirmation_for_movement(movement_id, user.id, add_cents)
 
     await notify(
@@ -1003,6 +1071,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update_all_panels(context)
 
+
+# =========================
+# MAIN
+# =========================
 
 def main():
     if not BOT_TOKEN:
