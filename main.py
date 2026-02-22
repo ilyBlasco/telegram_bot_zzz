@@ -501,7 +501,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             text=(
                 "<b>✍ Custom</b>\n\n"
-                "Envía un número como <code>420</code> o <code>420.50</code>.\n"
+                "Envía un número como <code>420</code> o <code>420.50</code>, Sin letras ni símbolos.\n"
                 f"<i>Tu mensaje se borrará automáticamente en {NOTIFY_DELETE_SECONDS}s.</i>"
             ),
             reply_markup=build_back_keyboard(),
@@ -519,7 +519,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total_cents <= 0:
             await notify(
                 context,
-                "La cantidad que intentas retirar es <b>$0.00</b> (coincidentemente, no hay nada que hacer).",
+                "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.",
             )
             return
 
@@ -586,7 +586,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
 
         if not rows:
-            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía."
+            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro."
         else:
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             lines = ["<b>📜 History (sesión actual)</b>", ""]
@@ -636,7 +636,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         msg = await update.effective_chat.send_message(
-            "Número inválido. Envía algo como <code>420</code> o <code>420.50</code>.",
+            "Número inválido. Envía algo como <code>420</code> o <code>420.50</code>, Sin letras ni símbolos.",
             parse_mode=ParseMode.HTML,
         )
         context.application.create_task(delete_later(context, chat_id, msg.message_id, NOTIFY_DELETE_SECONDS))
