@@ -501,7 +501,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             text=(
                 "<b>✍ Custom</b>\n\n"
-                "Envía un número como <code>420</code> o <code>420.50</code>, Sin letras ni símbolos.\n"
+                "Envía un número como <code>420</code> o <code>420.50</code>, Sin letras ni símbolos.\n\n"
                 f"<i>Tu mensaje se borrará automáticamente en {NOTIFY_DELETE_SECONDS}s.</i>"
             ),
             reply_markup=build_back_keyboard(),
