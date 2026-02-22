@@ -24,7 +24,7 @@ ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "6448246938")  # comma-separate
 NOTIFY_USER_IDS = os.getenv("NOTIFY_USER_IDS", "6448246938")  # comma-separated
 BANNER_URL = os.getenv("BANNER_URL", "").strip()  # optional public image URL
 
-# For testing: delete notifications after 10s. (3 hours = 10800)
+# Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
 
 # Per-user "waiting for custom amount" state (in-memory OK for one worker)
@@ -159,7 +159,7 @@ def set_total(chat_id: int, total_cents: int):
         conn.execute("UPDATE state SET total_cents = ? WHERE chat_id = ?", (total_cents, chat_id))
 
 
-def set_panel_message_id(chat_id: int, message_id: int):
+def set_panel_message_id(chat_id: int, message_id: int | None):
     with db() as conn:
         conn.execute("UPDATE state SET panel_message_id = ? WHERE chat_id = ?", (message_id, chat_id))
 
@@ -192,9 +192,7 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
         try:
             msg = await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
             # Auto-delete notification after N seconds
-            context.application.create_task(
-                delete_later(context, uid, msg.message_id, NOTIFY_DELETE_SECONDS)
-            )
+            context.application.create_task(delete_later(context, uid, msg.message_id, NOTIFY_DELETE_SECONDS))
         except Exception:
             pass
 
@@ -202,12 +200,12 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
 def build_panel_text(total_cents: int) -> str:
     fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
     return (
-        "<b>🔁 Yozu Tracker</b>\n\n"
-        f"<b>Total</b>: <code>${cents_to_money_str(total_cents)}</code>\n"
-        f"<b>Fee</b> ({(FEE_PCT * 100):.0f}%): <code>${cents_to_money_str(fee_cents)}</code>\n"
-        f"<b>Network fee</b>: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
-        f"<b>Net</b>: <code>${cents_to_money_str(net_cents)}</code>\n\n"
-        "<i>Usa los botones. El mensaje de Custom se borra automáticamente.</i>"
+        "光 ═══════════════════ 光\n\n"
+        f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
+        f"<b>Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
+        f"<b>Network fee</b> :: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
+        f"💵 <b>NET</b>   :: <code>${cents_to_money_str(net_cents)}</code>\n\n"
+        f"<i>⏳ Los mensajes se auto eliminan en {NOTIFY_DELETE_SECONDS}s</i>"
     )
 
 
@@ -220,13 +218,14 @@ def build_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("+100", callback_data="add:100"),
             ],
             [
-                InlineKeyboardButton("+200", callback_data="add:200"),
-                InlineKeyboardButton("+500", callback_data="add:500"),
-                InlineKeyboardButton("📝 Custom", callback_data="custom"),
+                InlineKeyboardButton("✍ Custom", callback_data="custom"),
             ],
             [
-                InlineKeyboardButton("🚀 Release", callback_data="release"),
                 InlineKeyboardButton("📜 History", callback_data="history"),
+                InlineKeyboardButton("⏪ Control + Z", callback_data="undo"),
+            ],
+            [
+                InlineKeyboardButton("解Release除", callback_data="release"),
             ],
         ]
     )
@@ -356,6 +355,114 @@ def log_movement(chat_id: int, session_id: int, kind: str, amount_cents: int, to
         )
 
 
+def get_last_movement(chat_id: int) -> sqlite3.Row | None:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, session_id, kind, amount_cents, total_after_cents, actor_id, created_at
+            FROM movements
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        return row
+
+
+def delete_movement(movement_id: int):
+    with db() as conn:
+        conn.execute("DELETE FROM movements WHERE id = ?", (movement_id,))
+
+
+def delete_latest_release_for_session(chat_id: int, session_id: int):
+    # Best effort: delete the latest release row for that session
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM releases
+            WHERE chat_id = ? AND session_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id, session_id),
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM releases WHERE id = ?", (row["id"],))
+
+
+async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    st = get_state(chat_id)
+
+    last = get_last_movement(chat_id)
+    if not last:
+        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer.")
+        return
+
+    last_kind = last["kind"]
+    last_amount = int(last["amount_cents"])
+    last_session = int(last["session_id"])
+
+    # If last action was an ADD: subtract it
+    if last_kind == "add":
+        # Ensure we are operating in the correct session context
+        # If state session is ahead (shouldn't happen unless something weird), clamp back
+        if st["session_id"] != last_session:
+            set_session_id(chat_id, last_session)
+
+        current_total = int(get_state(chat_id)["total_cents"])
+        new_total = current_total - last_amount
+        if new_total < 0:
+            new_total = 0
+
+        set_total(chat_id, new_total)
+        delete_movement(int(last["id"]))
+
+        await notify(
+            context,
+            (
+                "<b>Yozu Tracker</b>\n"
+                "<b>⏪ Control + Z</b>\n"
+                f"Se deshizo: <code>${cents_to_money_str(last_amount)}</code>\n"
+                f"Total: <code>${cents_to_money_str(new_total)}</code>"
+            ),
+        )
+
+        await edit_panel(update, context, text=build_panel_text(new_total), reply_markup=build_panel_keyboard())
+        return
+
+    # If last action was a RELEASE: restore that released total and restore session
+    if last_kind == "release":
+        # After release, the bot increments session_id and total is 0.
+        # Restore previous session and total from the release amount.
+        restored_total = last_amount
+        restored_session = last_session
+
+        set_session_id(chat_id, restored_session)
+        set_total(chat_id, restored_total)
+
+        # Remove the release record and the release movement itself (Ctrl+Z removes the last transaction)
+        delete_latest_release_for_session(chat_id, restored_session)
+        delete_movement(int(last["id"]))
+
+        await notify(
+            context,
+            (
+                "<b>Yozu Tracker</b>\n"
+                "<b>⏪ Control + Z</b>\n"
+                "Se deshizo un <b>Release</b>.\n"
+                f"Total restaurado: <code>${cents_to_money_str(restored_total)}</code>"
+            ),
+        )
+
+        await edit_panel(update, context, text=build_panel_text(restored_total), reply_markup=build_panel_keyboard())
+        return
+
+    # Unknown kind safeguard
+    await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -399,12 +506,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             context,
             text=(
-                "<b>📝 Custom</b>\n\n"
+                "<b>✍ Custom</b>\n\n"
                 "Envía un número como <code>420</code> o <code>420.50</code>.\n"
-                "<i>Tu mensaje se borrará automáticamente.</i>"
+                f"<i>Tu mensaje se borrará automáticamente en {NOTIFY_DELETE_SECONDS}s.</i>"
             ),
             reply_markup=build_back_keyboard(),
         )
+        return
+
+    if data == "undo":
+        await undo_last(update, context)
         return
 
     if data == "release":
@@ -436,7 +547,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             (
                 "<b>Yozu Tracker</b>\n"
-                "<b>🚀 Release</b>\n"
+                "<b>解Release除</b>\n"
                 f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
                 f"Fee: <code>${cents_to_money_str(fee_cents)}</code>\n"
                 f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
@@ -444,7 +555,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-        # Reset total and advance session (so history “se limpia” por release)
+        # Reset total and advance session (history resets for new session)
         set_total(chat_id, 0)
         set_session_id(chat_id, session_id + 1)
         AWAITING_CUSTOM_AMOUNT.discard(actor_id)
@@ -453,12 +564,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             context,
             text=(
-                "<b>✅ Released</b>\n\n"
+                "<b>Released</b>\n\n"
                 f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
                 f"Fee ({(FEE_PCT*100):.0f}%): <code>${cents_to_money_str(fee_cents)}</code>\n"
                 f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
                 f"Net: <code>${cents_to_money_str(net_cents)}</code>\n\n"
-                "El total se reinició a <b>$0.00</b> y el history se reinició para la nueva sesión."
+                "El total se reinició a <b>$0.00</b>."
             ),
             reply_markup=build_back_to_panel_keyboard(),
         )
@@ -466,6 +577,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "history":
+        # Show history for current session
         st = get_state(chat_id)
         session_id = st["session_id"]
 
@@ -488,7 +600,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in rows:
                 ts = r["created_at"].replace("T", " ").split(".")[0].replace("+00:00", " UTC")
                 kind = r["kind"]
-                label = "Suma" if kind == "add" else ("Release" if kind == "release" else kind)
+                label = "Add" if kind == "add" else ("Release" if kind == "release" else kind)
                 lines.append(
                     f"• <b>{label}</b>: <code>${cents_to_money_str(r['amount_cents'])}</code> "
                     f"→ Total: <code>${cents_to_money_str(r['total_after_cents'])}</code>\n"
@@ -532,8 +644,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Número inválido. Envía algo como <code>420</code> o <code>420.50</code>.",
             parse_mode=ParseMode.HTML,
         )
-        # auto-delete error message too
-        context.application.create_task(delete_later(context, chat_id, msg.message_id, 8))
+        # auto-delete error message too (use same env var)
+        context.application.create_task(delete_later(context, chat_id, msg.message_id, NOTIFY_DELETE_SECONDS))
         return
 
     # Remove waiting state
