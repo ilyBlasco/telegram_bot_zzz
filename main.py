@@ -424,7 +424,7 @@ def delete_latest_release_for_session(session_id: int):
 async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last = get_last_movement()
     if not last:
-        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer.")
+        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer lol.")
         return
 
     last_kind = last["kind"]
@@ -566,7 +566,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if total_cents <= 0:
             # Safe + non-toxic message
-            await notify(context, "La cantidad que intentas retirar es <b>$0.00</b>. No hay nada que retirar.")
+            await notify(context, "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.")
             return
 
         fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
@@ -631,7 +631,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
 
         if not rows:
-            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía."
+            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro."
         else:
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             lines = ["<b>📜 History (sesión actual)</b>", ""]
