@@ -449,11 +449,18 @@ def build_panel_text(total_cents: int) -> str:
 
     pending = pending_confirmations_count()
     pending_block = ""
+
     if pending > 0:
-        pending_block = (
-            f"\n危 {pending} movimientos no confirmados 危\n"
-            "(se autoconfirman en 24h)\n"
-        )
+        if pending == 1:
+            pending_block = (
+                "\n危 1 movimiento no confirmado 危\n"
+                "(se autoconfirma en 24h)\n"
+            )
+        else:
+            pending_block = (
+                f"\n危 {pending} movimientos no confirmados 危\n"
+                "(se autoconfirman en 24h)\n"
+            )
 
     return (
         "光 ═════════════ 光\n\n"
