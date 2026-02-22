@@ -200,12 +200,12 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
 def build_panel_text(total_cents: int) -> str:
     fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
     return (
-        "光 ═══════════════════ 光\n\n"
+        "光 ═════════════ 光\n\n"
         f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
-        f"<b>Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
-        f"<b>Network fee</b> :: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
+        f"<b>費 Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
+        f"<b>費 Network fee</b> :: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
         f"💵 <b>NET</b>   :: <code>${cents_to_money_str(net_cents)}</code>\n\n"
-        f"<i>⏳ Los mensajes se auto eliminan en {NOTIFY_DELETE_SECONDS}s</i>"
+        f"<i>⏳ Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s</i>"
     )
 
 
