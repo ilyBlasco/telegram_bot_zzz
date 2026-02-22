@@ -397,7 +397,7 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     last = get_last_movement(chat_id)
     if not last:
-        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer.")
+        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer lol.")
         return
 
     last_kind = last["kind"]
