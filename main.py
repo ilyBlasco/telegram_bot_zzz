@@ -134,11 +134,15 @@ def set_panel_message_id(chat_id: int, message_id: int):
 
 def build_panel_text(total_cents: int) -> str:
     fee_cents, net_cents = compute_fee_net(total_cents)
+    # Prettier / more structured panel text
     return (
-        f"<b>Running Total</b>: ${cents_to_money_str(total_cents)}\n"
-        f"<b>Fee</b> ({(FEE_PCT * 100):.0f}%): ${cents_to_money_str(fee_cents)}\n"
-        f"<b>Net (USDT)</b>: ${cents_to_money_str(net_cents)}\n\n"
-        f"<i>Use buttons below to add amounts or release.</i>"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>📊 Zelle Tracker</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 <b>Running Total</b>: <code>${cents_to_money_str(total_cents)}</code>\n"
+        f"📉 <b>Fee</b> ({(FEE_PCT * 100):.0f}%): <code>${cents_to_money_str(fee_cents)}</code>\n"
+        f"💵 <b>Net (USDT)</b>: <code>${cents_to_money_str(net_cents)}</code>\n\n"
+        "<i>Use the buttons below. Custom input will be auto-deleted.</i>"
     )
 
 
@@ -146,25 +150,29 @@ def build_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("+10", callback_data="add:10"),
-                InlineKeyboardButton("+50", callback_data="add:50"),
-                InlineKeyboardButton("+100", callback_data="add:100"),
+                InlineKeyboardButton("➕ 10", callback_data="add:10"),
+                InlineKeyboardButton("➕ 50", callback_data="add:50"),
+                InlineKeyboardButton("➕ 100", callback_data="add:100"),
             ],
             [
-                InlineKeyboardButton("+200", callback_data="add:200"),
-                InlineKeyboardButton("+500", callback_data="add:500"),
-                InlineKeyboardButton("Custom", callback_data="custom"),
+                InlineKeyboardButton("➕ 200", callback_data="add:200"),
+                InlineKeyboardButton("➕ 500", callback_data="add:500"),
+                InlineKeyboardButton("✍️ Custom", callback_data="custom"),
             ],
             [
-                InlineKeyboardButton("Release", callback_data="release"),
-                InlineKeyboardButton("History", callback_data="history"),
+                InlineKeyboardButton("✅ Release", callback_data="release"),
+                InlineKeyboardButton("🧾 History", callback_data="history"),
             ],
         ]
     )
 
 
-def build_history_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="back")]])
+def build_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
+
+
+def build_back_to_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to panel", callback_data="back")]])
 
 
 async def send_or_update_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,15 +243,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "custom":
         AWAITING_CUSTOM_AMOUNT.add(update.effective_user.id)
+        # Keep the UI on ONE message (no extra spam). We'll delete the user's numeric input later.
         await query.edit_message_text(
             text=(
-                "<b>Custom amount</b>\n"
-                "Send a number like <code>420</code> or <code>420.50</code>.\n\n"
-                "Then I will add it to the total."
+                "━━━━━━━━━━━━━━━━━━\n"
+                "<b>✍️ Custom Amount</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Send a number like <code>420</code> or <code>420.50</code>.\n"
+                "<i>Your message will be auto-deleted after processing.</i>"
             ),
-            reply_markup=build_history_keyboard(),
+            reply_markup=build_back_keyboard(),
             parse_mode=ParseMode.HTML,
         )
+        # Preserve panel message id (we are still editing the same message)
+        set_panel_message_id(chat_id, query.message.message_id)
         return
 
     if data == "release":
@@ -275,13 +288,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(
             text=(
-                "<b>Released</b>\n"
-                f"Total: ${cents_to_money_str(total_cents)}\n"
-                f"Fee ({(FEE_PCT*100):.0f}%): ${cents_to_money_str(fee_cents)}\n"
-                f"Net: ${cents_to_money_str(net_cents)}\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "<b>✅ Released</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                f"💰 Total: <code>${cents_to_money_str(total_cents)}</code>\n"
+                f"📉 Fee ({(FEE_PCT*100):.0f}%): <code>${cents_to_money_str(fee_cents)}</code>\n"
+                f"💵 Net: <code>${cents_to_money_str(net_cents)}</code>\n\n"
                 "Total has been reset to <b>$0.00</b>."
             ),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to panel", callback_data="back")]]),
+            reply_markup=build_back_to_panel_keyboard(),
             parse_mode=ParseMode.HTML,
         )
         set_panel_message_id(chat_id, query.message.message_id)
@@ -301,26 +316,38 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
 
         if not rows:
-            hist_text = "<b>History</b>\nNo releases yet."
+            hist_text = (
+                "━━━━━━━━━━━━━━━━━━\n"
+                "<b>🧾 History</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "No releases yet."
+            )
         else:
-            lines = ["<b>History (last 10)</b>"]
+            lines = [
+                "━━━━━━━━━━━━━━━━━━",
+                "<b>🧾 History (last 10)</b>",
+                "━━━━━━━━━━━━━━━━━━",
+                "",
+            ]
             for r in rows:
                 ts = r["released_at"].replace("T", " ").split(".")[0].replace("+00:00", " UTC")
                 lines.append(
-                    f"• ${cents_to_money_str(r['released_total_cents'])} "
-                    f"(fee ${cents_to_money_str(r['fee_cents'])}, net ${cents_to_money_str(r['net_cents'])}) "
-                    f"- {ts}"
+                    f"• <code>${cents_to_money_str(r['released_total_cents'])}</code> "
+                    f"(fee <code>${cents_to_money_str(r['fee_cents'])}</code>, "
+                    f"net <code>${cents_to_money_str(r['net_cents'])}</code>)\n"
+                    f"  <i>{ts}</i>"
                 )
             hist_text = "\n".join(lines)
 
         await query.edit_message_text(
             text=hist_text,
-            reply_markup=build_history_keyboard(),
+            reply_markup=build_back_keyboard(),
             parse_mode=ParseMode.HTML,
         )
+        set_panel_message_id(chat_id, query.message.message_id)
         return
 
-    if data in ("back",):
+    if data == "back":
         # Return to panel
         st = get_state(chat_id)
         total_cents = st["total_cents"]
@@ -347,16 +374,49 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         add_cents = money_to_cents(text)
     except Exception:
-        await update.message.reply_text("Invalid number. Send something like 420 or 420.50.")
+        # Delete invalid custom input too (keeps chat clean)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
+        except Exception:
+            pass
+        await update.effective_chat.send_message(
+            "❌ Invalid number. Send something like <code>420</code> or <code>420.50</code>.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
+    # Remove waiting state
     AWAITING_CUSTOM_AMOUNT.discard(user_id)
 
+    # Update total
     st = get_state(chat_id)
     total_cents = st["total_cents"] + add_cents
     set_total(chat_id, total_cents)
 
-    # Show panel again
+    # Delete the user's numeric message to prevent spam/scrolling
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
+    except Exception:
+        # If deletion fails (permissions, etc.), ignore.
+        pass
+
+    # Update panel in place (no new messages)
+    st = get_state(chat_id)
+    panel_message_id = st.get("panel_message_id")
+    if panel_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=panel_message_id,
+                text=build_panel_text(total_cents),
+                reply_markup=build_panel_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            pass
+
+    # Fallback: if panel id missing or edit fails, send/update panel normally
     await send_or_update_panel(update, context)
 
 
