@@ -245,7 +245,7 @@ def build_panel_text(total_cents: int) -> str:
         f"<b>費 Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
         f"<b>費 Network fee</b> :: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
         f"💵 <b>NET</b>   :: <code>${cents_to_money_str(net_cents)}</code>\n\n"
-        "<b>(ZELLE CAPTURE ONLY)</b>\n"
+        "<b>(ZELLE CAPTURE ONLY)</b>\n\n"
         f"<i>⏳ Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s</i>"
     )
 
