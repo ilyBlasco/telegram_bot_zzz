@@ -911,7 +911,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Non-toxic, stable behavior: do nothing besides notifying
             await notify(
                 context,
-                "La cantidad que intentas retirar es <b>$0.00</b>. No hay nada que retirar.",
+                "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.",
             )
             await update_all_panels(context)
             return
@@ -980,7 +980,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
 
         if not rows:
-            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía."
+            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro."
         else:
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             lines = ["<b>📜 History (sesión actual)</b>", ""]
