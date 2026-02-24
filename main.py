@@ -54,6 +54,19 @@ if KRAKEN_DEPOSIT_ESTIMATOR_MODE not in {"off", "shadow", "ui"}:
 KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT", "50")))
 KRAKEN_DEPOSIT_STATUS_MAX_PAGES = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_MAX_PAGES", "10")))
 KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS", "14")))
+_KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS_RAW = (os.getenv("KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS", "-23").strip() or "-23")
+_KRAKEN_HOLD_ESTIMATE_OFFSET_INVALID = False
+try:
+    KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS = int(_KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS_RAW)
+except Exception:
+    KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS = -23
+    _KRAKEN_HOLD_ESTIMATE_OFFSET_INVALID = True
+if KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS < -48:
+    KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS = -48
+    _KRAKEN_HOLD_ESTIMATE_OFFSET_INVALID = True
+elif KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS > 48:
+    KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS = 48
+    _KRAKEN_HOLD_ESTIMATE_OFFSET_INVALID = True
 KRAKEN_DISPLAY_TZ = os.getenv("KRAKEN_DISPLAY_TZ", "America/Chicago").strip() or "America/Chicago"
 _KRAKEN_DEPOSIT_TIME_ANCHOR_ALLOWED = {"auto", "processed", "completed", "accepted", "time", "request", "created"}
 _KRAKEN_DEPOSIT_TIME_ANCHOR_RAW = (os.getenv("KRAKEN_DEPOSIT_TIME_ANCHOR", "auto").strip().lower() or "auto")
@@ -88,6 +101,7 @@ KRAKEN_REFRESH_TASK: asyncio.Task | None = None
 _KRAKEN_DISPLAY_TZINFO = None
 _KRAKEN_DISPLAY_TZ_WARNED = False
 _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED = False
+_KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED = False
 
 KRAKEN_CACHE: dict = {
     "enabled": bool(KRAKEN_API_KEY and KRAKEN_API_SECRET),
@@ -109,6 +123,7 @@ KRAKEN_CACHE: dict = {
     "deposit_hold_total_usd": None,  # Decimal | None
     "last_success_at_deposit_status": None,
     "last_error_deposit_status": None,
+    "countdown_refresh_bucket": None,
 }
 
 
@@ -835,6 +850,28 @@ def _format_countdown_short(now_dt: datetime, target_dt: datetime) -> str:
     return f"{minutes}m"
 
 
+def _kraken_countdown_refresh_bucket(snapshot: dict, now_dt: datetime) -> str | None:
+    deposit_status = str(snapshot.get("deposit_estimator_status") or "")
+    if deposit_status not in {"ok", "stale"}:
+        return None
+
+    active_unlocks: list[datetime] = []
+    for row in (snapshot.get("deposit_hold_rows_usd") or []):
+        amount_usd = _kraken_decimal_or_none(row.get("amount_usd"))
+        unlock_at = _parse_iso_utc_or_none(row.get("unlock_at_iso"))
+        if amount_usd is None or amount_usd <= 0 or unlock_at is None or unlock_at <= now_dt:
+            continue
+        active_unlocks.append(unlock_at)
+
+    if not active_unlocks:
+        return None
+
+    has_under_24h = any((unlock_at - now_dt).total_seconds() < 24 * 60 * 60 for unlock_at in active_unlocks)
+    if has_under_24h:
+        return now_dt.strftime("m:%Y%m%d%H%M")
+    return now_dt.strftime("h:%Y%m%d%H")
+
+
 def _kraken_asset_matches_target(asset_value: str | None) -> bool:
     asset_upper = str(asset_value or "").upper()
     return asset_upper == KRAKEN_ASSET or asset_upper.startswith(KRAKEN_ASSET + ".")
@@ -868,8 +905,8 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
             continue
         active_total += amount_usd
         row_lines.append(
-            f"<i>{_format_usd_row_amount(amount_usd)} &middot; "
-            f"{_format_countdown_short(render_now, unlock_at)} &middot; {_format_kraken_display_time_short(unlock_at)}</i>"
+            f"<i>{_format_usd_row_amount(amount_usd)} &#183; "
+            f"{_format_countdown_short(render_now, unlock_at)} &#183; {_format_kraken_display_time_short(unlock_at)}</i>"
         )
 
     total_usd = active_total
@@ -1226,7 +1263,7 @@ def _fetch_usd_deposit_events_with_pagination(fetch_now: datetime) -> tuple[list
 
 
 def _estimate_usd_hold_rows_from_deposits(events: list[dict], now_dt: datetime) -> list[dict]:
-    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS)
+    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS, hours=KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS)
     rows_by_minute: dict[str, dict] = {}
 
     for ev in events:
@@ -1395,7 +1432,7 @@ def _estimate_unlock_rows_fifo(events: list[dict], now_dt: datetime) -> list[dic
 
 
 async def refresh_kraken_cache_once(app: Application) -> None:
-    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED
+    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED, _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED
     if not KRAKEN_CACHE["enabled"]:
         return
     if _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID and not _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED:
@@ -1403,6 +1440,13 @@ async def refresh_kraken_cache_once(app: Application) -> None:
         logger.warning(
             "Invalid KRAKEN_DEPOSIT_TIME_ANCHOR '%s'; falling back to 'auto'",
             _KRAKEN_DEPOSIT_TIME_ANCHOR_RAW,
+        )
+    if _KRAKEN_HOLD_ESTIMATE_OFFSET_INVALID and not _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED:
+        _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED = True
+        logger.warning(
+            "Invalid/out-of-range KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS '%s'; using %s",
+            _KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS_RAW,
+            KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS,
         )
 
     should_refresh_panels = False
@@ -1491,17 +1535,19 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                 if deposit_hold_rows_usd:
                     first = deposit_hold_rows_usd[0]
                     logger.info(
-                        "Kraken deposit hold estimate refreshed: deposits=%s active_rows=%s hold_total=%s next=%s %s",
+                        "Kraken deposit hold estimate refreshed: deposits=%s active_rows=%s hold_total=%s next=%s %s offset_hours=%s",
                         len(deposit_events),
                         len(deposit_hold_rows_usd),
                         _format_usd_est_amount_int(deposit_hold_total_usd),
                         first.get("unlock_at_iso"),
                         _format_usd_row_amount(_kraken_decimal_or_none(first.get("amount_usd"))),
+                        KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS,
                     )
                 else:
                     logger.info(
-                        "Kraken deposit hold estimate refreshed: deposits=%s active_rows=0 hold_total=$0",
+                        "Kraken deposit hold estimate refreshed: deposits=%s active_rows=0 hold_total=$0 offset_hours=%s",
                         len(deposit_events),
+                        KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS,
                     )
 
                 source_counts: dict[str, int] = {}
@@ -1519,9 +1565,10 @@ async def refresh_kraken_cache_once(app: Application) -> None:
         after_block = _format_kraken_dashboard_block(after_snapshot, render_now=refresh_now)
         should_refresh_panels = after_block != before_block
         if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "ui":
-            deposit_status = str(after_snapshot.get("deposit_estimator_status") or "")
-            has_rows = bool(after_snapshot.get("deposit_hold_rows_usd"))
-            force_countdown_refresh = deposit_status in {"ok", "stale"} and has_rows
+            current_bucket = _kraken_countdown_refresh_bucket(after_snapshot, refresh_now)
+            prev_bucket = KRAKEN_CACHE.get("countdown_refresh_bucket")
+            force_countdown_refresh = current_bucket is not None and current_bucket != prev_bucket
+            KRAKEN_CACHE["countdown_refresh_bucket"] = current_bucket
 
     if should_refresh_panels or force_countdown_refresh:
         try:
@@ -1746,6 +1793,7 @@ async def send_or_update_panel_for_app(chat_id: int, app: Application):
                 caption=text,
                 reply_markup=kb,
                 parse_mode=ParseMode.HTML,
+                disable_notification=True,
             )
             set_panel_mode(chat_id, "banner")
             set_panel_message_id(chat_id, msg.message_id)
@@ -1758,6 +1806,7 @@ async def send_or_update_panel_for_app(chat_id: int, app: Application):
         text=text,
         reply_markup=kb,
         parse_mode=ParseMode.HTML,
+        disable_notification=True,
     )
     set_panel_message_id(chat_id, msg.message_id)
 
