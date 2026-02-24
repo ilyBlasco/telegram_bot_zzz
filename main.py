@@ -69,7 +69,7 @@ KRAKEN_REFRESH_TASK: asyncio.Task | None = None
 KRAKEN_CACHE: dict = {
     "enabled": bool(KRAKEN_API_KEY and KRAKEN_API_SECRET),
     "balance_status": "loading" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "disabled",
-    "ledger_status": "loading" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "disabled",
+    "ledger_status": "disabled",
     "balance_usdt": None,  # Decimal | None
     "tradable_usdt": None,  # Display tradable (ledger-estimated when available)
     "locked_usdt": None,  # Display locked (ledger-estimated when available)
@@ -775,48 +775,12 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
         render_now = now_utc()
 
     balance_status = str(snapshot.get("balance_status") or "")
-    ledger_status = str(snapshot.get("ledger_status") or "")
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
-    tradable = _kraken_decimal_or_none(snapshot.get("tradable_usdt"))
-    locked = _kraken_decimal_or_none(snapshot.get("locked_usdt"))
 
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
-    tradable_str = _format_kraken_amount_4(tradable) if tradable is not None else "--"
-    locked_str = _format_kraken_amount_int_readable(locked) if locked is not None else "--"
-
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
 
-    lines = [
-        f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>",
-        f"<b>KRAKEN TRADABLE: {tradable_str} (USDT)</b>",
-        f"<b>KRAKEN LOCKED: {locked_str} (USDT)</b>",
-    ]
-
-    if balance_status == "stale":
-        lines.append("<i>⚠ Kraken refresh failed, showing cached data</i>")
-    elif ledger_status == "stale":
-        lines.append("<i>⚠ Kraken unlock estimate refresh failed, showing cached estimate</i>")
-
-    if locked is not None and locked > 0:
-        unlock_lines: list[str] = []
-        for row in snapshot.get("unlock_rows") or []:
-            amount = _kraken_decimal_or_none(row.get("amount_usdt"))
-            unlock_at = _parse_iso_utc_or_none(row.get("unlock_at_iso"))
-            if amount is None or amount <= 0 or unlock_at is None:
-                continue
-
-            unlock_lines.append(
-                f"<i>+{_format_kraken_amount_int_readable(amount)} USDT · "
-                f"{_format_countdown_short(render_now, unlock_at)} · {_format_utc_short(unlock_at)}</i>"
-            )
-
-        if unlock_lines:
-            lines.append("<i>UNLOCKS [EST]:</i>")
-            lines.extend(unlock_lines)
-        else:
-            lines.append("<i>UNLOCKS [EST]: --</i>")
-
-    return "\n".join(lines)
+    return f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"
 
 
 def _kraken_sign(url_path: str, nonce: str, postdata: str, api_secret_b64: str) -> str:
@@ -1078,7 +1042,6 @@ async def refresh_kraken_cache_once(app: Application) -> None:
         return
 
     should_refresh_panels = False
-    force_countdown_refresh = False
     refresh_now = now_utc()
 
     async with KRAKEN_REFRESH_LOCK:
@@ -1112,96 +1075,16 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                 _format_kraken_amount_4(locked_usdt),
             )
 
-        try:
-            events, hit_cap = await asyncio.to_thread(_fetch_usdt_ledger_events_with_pagination, refresh_now)
-            unlock_rows = _estimate_unlock_rows_fifo(events, refresh_now)
-        except Exception as e:
-            had_success = KRAKEN_CACHE.get("last_success_at_ledger") is not None
-            KRAKEN_CACHE["ledger_status"] = "stale" if had_success else "error"
-            KRAKEN_CACHE["last_error_ledger"] = str(e)[:200]
-            logger.warning("Kraken unlock estimate refresh failed: %s", KRAKEN_CACHE["last_error_ledger"])
-            # If ledger estimation never succeeded, fall back to raw API tradable/locked.
-            if not had_success:
-                api_tradable = _kraken_decimal_or_none(KRAKEN_CACHE.get("api_tradable_usdt"))
-                api_locked = _kraken_decimal_or_none(KRAKEN_CACHE.get("api_locked_usdt"))
-                if api_tradable is not None:
-                    KRAKEN_CACHE["tradable_usdt"] = api_tradable
-                if api_locked is not None:
-                    KRAKEN_CACHE["locked_usdt"] = api_locked
-        else:
-            KRAKEN_CACHE["ledger_status"] = "ok"
-            KRAKEN_CACHE["unlock_rows"] = unlock_rows
-            KRAKEN_CACHE["last_success_at_ledger"] = now_utc_iso()
-            KRAKEN_CACHE["last_error_ledger"] = None
-
-            balance_for_display = _kraken_decimal_or_none(KRAKEN_CACHE.get("balance_usdt"))
-            estimated_locked = sum(
-                (
-                    _kraken_decimal_or_none(row.get("amount_usdt")) or Decimal("0")
-                    for row in unlock_rows
-                ),
-                Decimal("0"),
-            )
-            if estimated_locked < 0:
-                estimated_locked = Decimal("0")
-            if balance_for_display is not None:
-                if estimated_locked > balance_for_display:
-                    estimated_locked = balance_for_display
-                display_tradable = balance_for_display - estimated_locked
-                if display_tradable < 0:
-                    display_tradable = Decimal("0")
-                KRAKEN_CACHE["locked_usdt"] = estimated_locked
-                KRAKEN_CACHE["tradable_usdt"] = display_tradable
-
-            if hit_cap:
-                logger.warning(
-                    "Kraken ledger pagination cap hit (%s pages); unlock estimate may be incomplete",
-                    KRAKEN_LEDGER_MAX_PAGES,
-                )
-
-            matched_assets = sorted({str(ev.get("asset") or "") for ev in events if ev.get("asset")})
-            logger.info(
-                "Kraken ledger events matched for %s: count=%s assets=%s",
-                KRAKEN_ASSET,
-                len(events),
-                ",".join(matched_assets) if matched_assets else "none",
-            )
-
-            if unlock_rows:
-                first = unlock_rows[0]
-                first_amt = _kraken_decimal_or_none(first.get("amount_usdt")) or Decimal("0")
-                logger.info(
-                    "Kraken unlock rows refreshed: count=%s next=%s +%s %s",
-                    len(unlock_rows),
-                    first.get("unlock_at_iso"),
-                    _format_kraken_amount_int_readable(first_amt),
-                    KRAKEN_ASSET,
-                )
-            else:
-                logger.info("Kraken unlock rows refreshed: count=0")
-
-            display_tradable = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_usdt"))
-            display_locked = _kraken_decimal_or_none(KRAKEN_CACHE.get("locked_usdt"))
-            raw_api_tradable = _kraken_decimal_or_none(KRAKEN_CACHE.get("api_tradable_usdt"))
-            raw_api_locked = _kraken_decimal_or_none(KRAKEN_CACHE.get("api_locked_usdt"))
-            if display_tradable is not None and display_locked is not None:
-                logger.info(
-                    "Kraken display values set tradable=%s locked=%s (raw_api_tradable=%s raw_api_locked=%s)",
-                    _format_kraken_amount_4(display_tradable),
-                    _format_kraken_amount_4(display_locked),
-                    _format_kraken_amount_4(raw_api_tradable or Decimal("0")) if raw_api_tradable is not None else "--",
-                    _format_kraken_amount_4(raw_api_locked or Decimal("0")) if raw_api_locked is not None else "--",
-                )
+        # Hotfix mode: disable unsupported hold/unlock estimation to avoid misleading values.
+        KRAKEN_CACHE["ledger_status"] = "disabled"
+        KRAKEN_CACHE["unlock_rows"] = []
+        KRAKEN_CACHE["last_error_ledger"] = None
 
         after_snapshot = _kraken_state_snapshot()
         after_block = _format_kraken_dashboard_block(after_snapshot, render_now=refresh_now)
         should_refresh_panels = after_block != before_block
-        locked_for_display = _kraken_decimal_or_none(after_snapshot.get("locked_usdt"))
-        force_countdown_refresh = bool(after_snapshot.get("unlock_rows")) and bool(
-            locked_for_display is not None and locked_for_display > 0
-        )
 
-    if should_refresh_panels or force_countdown_refresh:
+    if should_refresh_panels:
         try:
             await update_all_panels_for_app(app)
         except Exception:
