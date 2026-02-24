@@ -1370,6 +1370,9 @@ def main():
         level=getattr(logging, LOG_LEVEL, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Avoid leaking the Telegram bot token via HTTP request URLs in INFO logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     init_db()
 
