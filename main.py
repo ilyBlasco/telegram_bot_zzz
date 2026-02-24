@@ -2,8 +2,17 @@ import os
 import sqlite3
 import asyncio
 import logging
+import json
+import time
+import base64
+import hmac
+import hashlib
+import contextlib
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -27,6 +36,16 @@ FEE_PCT = Decimal(os.getenv("FEE_PCT", "0.02"))  # 2% default
 NETWORK_FEE = Decimal(os.getenv("NETWORK_FEE", "0.30"))  # $0.30 flat
 BANNER_URL = os.getenv("BANNER_URL", "").strip()  # optional public image URL
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "").strip()
+KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "").strip()
+KRAKEN_REFRESH_SECONDS = max(5, int(os.getenv("KRAKEN_REFRESH_SECONDS", "60")))
+KRAKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("KRAKEN_TIMEOUT_SECONDS", "10")))
+KRAKEN_ASSET = (os.getenv("KRAKEN_ASSET", "USDT").strip().upper() or "USDT")
+KRAKEN_HOLD_DAYS = max(1, int(os.getenv("KRAKEN_HOLD_DAYS", "8")))
+KRAKEN_LEDGER_MAX_PAGES = max(1, int(os.getenv("KRAKEN_LEDGER_MAX_PAGES", "10")))
+KRAKEN_API_BASE = "https://api.kraken.com"
+KRAKEN_BALANCE_EX_PATH = "/0/private/BalanceEx"
+KRAKEN_LEDGERS_PATH = "/0/private/Ledgers"
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
@@ -44,6 +63,23 @@ logger = logging.getLogger(__name__)
 
 # Serialize state-changing DB operations inside this single process.
 STATE_LOCK = asyncio.Lock()
+KRAKEN_REFRESH_LOCK = asyncio.Lock()
+KRAKEN_REFRESH_TASK: asyncio.Task | None = None
+
+KRAKEN_CACHE: dict = {
+    "enabled": bool(KRAKEN_API_KEY and KRAKEN_API_SECRET),
+    "balance_status": "loading" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "disabled",
+    "ledger_status": "loading" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "disabled",
+    "balance_usdt": None,  # Decimal | None
+    "tradable_usdt": None,  # Decimal | None
+    "locked_usdt": None,  # Decimal | None
+    "unlock_rows": [],  # list[dict[str, Decimal|str]]
+    "last_success_at_balance": None,
+    "last_success_at_ledger": None,
+    "last_attempt_at": None,
+    "last_error_balance": None,
+    "last_error_ledger": None,
+}
 
 
 # =========================
@@ -663,11 +699,504 @@ def delete_latest_release_for_session(session_id: int):
 
 
 # =========================
+# KRAKEN BALANCE (CACHE + API)
+# =========================
+
+def _kraken_state_snapshot() -> dict:
+    snap = dict(KRAKEN_CACHE)
+    snap["unlock_rows"] = [dict(row) for row in (KRAKEN_CACHE.get("unlock_rows") or [])]
+    return snap
+
+
+def _format_kraken_amount_4(value: Decimal) -> str:
+    q = value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    return f"{q:.4f}"
+
+
+def _kraken_decimal_or_none(value) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _format_kraken_amount_int_readable(value: Decimal) -> str:
+    if value > 0 and value < 1:
+        return "<1"
+    if value < 0 and value > -1:
+        return ">-1"
+    return str(int(value))
+
+
+def _parse_iso_utc_or_none(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = iso_to_dt(str(s))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_utc_short(dt: datetime) -> str:
+    dt_utc = dt.astimezone(timezone.utc)
+    return f"{dt_utc.strftime('%b')} {dt_utc.day} {dt_utc.strftime('%H:%M')} UTC"
+
+
+def _format_countdown_short(now_dt: datetime, target_dt: datetime) -> str:
+    delta_seconds = int((target_dt - now_dt).total_seconds())
+    if delta_seconds <= 0:
+        return "NOW"
+
+    total_minutes = max(1, (delta_seconds + 59) // 60)
+    days, rem_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(rem_minutes, 60)
+
+    if days > 0:
+        return f"{days}d {hours:02d}h"
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None = None) -> str:
+    if render_now is None:
+        render_now = now_utc()
+
+    balance_status = str(snapshot.get("balance_status") or "")
+    ledger_status = str(snapshot.get("ledger_status") or "")
+    balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
+    tradable = _kraken_decimal_or_none(snapshot.get("tradable_usdt"))
+    locked = _kraken_decimal_or_none(snapshot.get("locked_usdt"))
+
+    balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
+    tradable_str = _format_kraken_amount_4(tradable) if tradable is not None else "--"
+    locked_str = _format_kraken_amount_int_readable(locked) if locked is not None else "--"
+
+    stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
+
+    lines = [
+        f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>",
+        f"<b>KRAKEN TRADABLE: {tradable_str} (USDT)</b>",
+        f"<b>KRAKEN LOCKED: {locked_str} (USDT)</b>",
+    ]
+
+    if balance_status == "stale":
+        lines.append("<i>⚠ Kraken refresh failed, showing cached data</i>")
+    elif ledger_status == "stale":
+        lines.append("<i>⚠ Kraken unlock estimate refresh failed, showing cached estimate</i>")
+
+    if locked is not None and locked > 0:
+        unlock_lines: list[str] = []
+        for row in snapshot.get("unlock_rows") or []:
+            amount = _kraken_decimal_or_none(row.get("amount_usdt"))
+            unlock_at = _parse_iso_utc_or_none(row.get("unlock_at_iso"))
+            if amount is None or amount <= 0 or unlock_at is None:
+                continue
+
+            unlock_lines.append(
+                f"<i>+{_format_kraken_amount_int_readable(amount)} USDT · "
+                f"{_format_countdown_short(render_now, unlock_at)} · {_format_utc_short(unlock_at)}</i>"
+            )
+
+        if unlock_lines:
+            lines.append("<i>UNLOCKS [EST]:</i>")
+            lines.extend(unlock_lines)
+        else:
+            lines.append("<i>UNLOCKS [EST]: --</i>")
+
+    return "\n".join(lines)
+
+
+def _kraken_sign(url_path: str, nonce: str, postdata: str, api_secret_b64: str) -> str:
+    secret = base64.b64decode(api_secret_b64)
+    sha256_digest = hashlib.sha256((nonce + postdata).encode("utf-8")).digest()
+    message = url_path.encode("utf-8") + sha256_digest
+    sig = hmac.new(secret, message, hashlib.sha512).digest()
+    return base64.b64encode(sig).decode("utf-8")
+
+
+def _kraken_private_post_sync(url_path: str, extra_form: dict | None = None) -> dict:
+    if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
+        raise RuntimeError("Kraken credentials not configured")
+
+    nonce = str(int(time.time() * 1000))
+    form = {"nonce": nonce}
+    for key, value in (extra_form or {}).items():
+        if value is None:
+            continue
+        form[str(key)] = str(value)
+    postdata = urllib_parse.urlencode(form)
+    api_sign = _kraken_sign(url_path, nonce, postdata, KRAKEN_API_SECRET)
+
+    req = urllib_request.Request(
+        url=f"{KRAKEN_API_BASE}{url_path}",
+        data=postdata.encode("utf-8"),
+        headers={
+            "API-Key": KRAKEN_API_KEY,
+            "API-Sign": api_sign,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "telegram_bot_zzz/kraken-balance",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(req, timeout=KRAKEN_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib_error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        body_short = body[:200].replace("\n", " ").strip()
+        raise RuntimeError(f"Kraken HTTP {e.code}: {body_short or e.reason}") from e
+    except urllib_error.URLError as e:
+        raise RuntimeError(f"Kraken network error: {e.reason}") from e
+
+    try:
+        payload = json.loads(body)
+    except Exception as e:
+        raise RuntimeError("Kraken returned invalid JSON") from e
+
+    errors = payload.get("error") or []
+    if errors:
+        msg = "; ".join(str(x) for x in errors)
+        if "otp" in msg.lower():
+            raise RuntimeError("Kraken API key requires OTP/2FA (unsupported)")
+        raise RuntimeError(f"Kraken API error: {msg}")
+
+    if not isinstance(payload.get("result"), dict):
+        raise RuntimeError("Kraken response missing result object")
+
+    return payload
+
+
+def _kraken_private_post_balance_ex_sync() -> dict:
+    return _kraken_private_post_sync(KRAKEN_BALANCE_EX_PATH, {})
+
+
+def _kraken_private_post_ledgers_sync(ofs: int = 0) -> dict:
+    return _kraken_private_post_sync(KRAKEN_LEDGERS_PATH, {"asset": KRAKEN_ASSET, "ofs": ofs})
+
+
+def _extract_balance_split_usdt(payload: dict) -> tuple[Decimal, Decimal, Decimal]:
+    result = payload.get("result") or {}
+    asset = result.get(KRAKEN_ASSET)
+    if asset is None:
+        return Decimal("0"), Decimal("0"), Decimal("0")
+
+    if isinstance(asset, dict):
+        try:
+            balance = Decimal(str(asset.get("balance", "0")))
+        except Exception as e:
+            raise RuntimeError(f"Invalid {KRAKEN_ASSET} balance from Kraken") from e
+
+        if asset.get("available") is not None:
+            try:
+                tradable = Decimal(str(asset.get("available")))
+            except Exception as e:
+                raise RuntimeError(f"Invalid {KRAKEN_ASSET} available from Kraken") from e
+        elif asset.get("hold_trade") is not None:
+            try:
+                tradable = balance - Decimal(str(asset.get("hold_trade")))
+            except Exception as e:
+                raise RuntimeError(f"Invalid {KRAKEN_ASSET} hold_trade from Kraken") from e
+        else:
+            tradable = balance
+    else:
+        try:
+            balance = Decimal(str(asset))
+        except Exception as e:
+            raise RuntimeError(f"Invalid {KRAKEN_ASSET} value from Kraken") from e
+        tradable = balance
+
+    if tradable < 0:
+        tradable = Decimal("0")
+    if balance >= 0 and tradable > balance:
+        tradable = balance
+
+    locked = balance - tradable
+    if locked < 0:
+        locked = Decimal("0")
+
+    return balance, tradable, locked
+
+
+def _extract_usdt_ledger_events(payload: dict) -> list[dict]:
+    result = payload.get("result") or {}
+    ledger_map = result.get("ledger")
+    if not isinstance(ledger_map, dict):
+        raise RuntimeError("Kraken Ledgers response missing ledger object")
+
+    events: list[dict] = []
+    for ledger_id, item in ledger_map.items():
+        if not isinstance(item, dict):
+            continue
+
+        if str(item.get("asset") or "").upper() != KRAKEN_ASSET:
+            continue
+
+        try:
+            amount = Decimal(str(item.get("amount")))
+            ev_time = datetime.fromtimestamp(float(item.get("time")), tz=timezone.utc)
+        except Exception:
+            continue
+
+        events.append(
+            {
+                "id": str(ledger_id),
+                "refid": str(item.get("refid") or ""),
+                "time": ev_time,
+                "amount": amount,
+            }
+        )
+
+    return events
+
+
+def _fetch_usdt_ledger_events_with_pagination(fetch_now: datetime) -> tuple[list[dict], bool]:
+    cutoff = fetch_now - timedelta(days=KRAKEN_HOLD_DAYS)
+    ofs = 0
+    all_events: list[dict] = []
+    hit_cap = True
+
+    for _ in range(KRAKEN_LEDGER_MAX_PAGES):
+        payload = _kraken_private_post_ledgers_sync(ofs=ofs)
+        result = payload.get("result") or {}
+        ledger_map = result.get("ledger")
+        if not isinstance(ledger_map, dict):
+            raise RuntimeError("Kraken Ledgers response missing ledger object")
+        if not ledger_map:
+            hit_cap = False
+            break
+
+        page_events = _extract_usdt_ledger_events(payload)
+        all_events.extend(page_events)
+
+        page_len = len(ledger_map)
+        ofs += page_len
+
+        oldest_page_time = None
+        for ev in page_events:
+            t = ev["time"]
+            if oldest_page_time is None or t < oldest_page_time:
+                oldest_page_time = t
+
+        try:
+            count = int(result["count"]) if result.get("count") is not None else None
+        except Exception:
+            count = None
+
+        if oldest_page_time is not None and oldest_page_time <= cutoff:
+            hit_cap = False
+            break
+        if count is not None and ofs >= count:
+            hit_cap = False
+            break
+        if page_len <= 0:
+            hit_cap = False
+            break
+
+    all_events.sort(key=lambda e: (e["time"], e.get("id") or "", e.get("refid") or ""))
+    return all_events, hit_cap
+
+
+def _estimate_unlock_rows_fifo(events: list[dict], locked_usdt: Decimal | None, now_dt: datetime) -> tuple[list[dict], bool]:
+    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS)
+    lots: list[dict] = []
+
+    for ev in events:
+        ev_time = ev.get("time")
+        amount = _kraken_decimal_or_none(ev.get("amount"))
+        if not isinstance(ev_time, datetime) or amount is None:
+            continue
+
+        if amount > 0:
+            lots.append(
+                {
+                    "unlock_at": ev_time + hold_delta,
+                    "remaining": amount,
+                }
+            )
+            continue
+
+        if amount >= 0:
+            continue
+
+        to_consume = -amount
+        for lot in lots:
+            if to_consume <= 0:
+                break
+            rem = lot["remaining"]
+            if rem <= 0:
+                continue
+            take = rem if rem <= to_consume else to_consume
+            lot["remaining"] = rem - take
+            to_consume -= take
+
+    rows_by_minute: dict[str, dict] = {}
+    for lot in lots:
+        remaining = lot["remaining"]
+        unlock_at = lot["unlock_at"]
+        if remaining <= 0 or unlock_at <= now_dt:
+            continue
+
+        minute_dt = unlock_at.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        minute_key = dt_to_iso(minute_dt)
+        row = rows_by_minute.get(minute_key)
+        if row is None:
+            row = {"unlock_at": minute_dt, "amount_usdt": Decimal("0")}
+            rows_by_minute[minute_key] = row
+        row["amount_usdt"] += remaining
+
+    rows = sorted(rows_by_minute.values(), key=lambda r: r["unlock_at"])
+
+    incomplete = False
+    target_locked = _kraken_decimal_or_none(locked_usdt)
+    if target_locked is not None and target_locked >= 0:
+        estimated_total = sum((r["amount_usdt"] for r in rows), Decimal("0"))
+        if estimated_total > target_locked:
+            excess = estimated_total - target_locked
+            for row in reversed(rows):
+                if excess <= 0:
+                    break
+                row_amt = row["amount_usdt"]
+                if row_amt <= 0:
+                    continue
+                take = row_amt if row_amt <= excess else excess
+                row["amount_usdt"] = row_amt - take
+                excess -= take
+            rows = [r for r in rows if r["amount_usdt"] > 0]
+        elif estimated_total < target_locked and target_locked > 0:
+            incomplete = True
+
+    out_rows = [
+        {"unlock_at_iso": dt_to_iso(r["unlock_at"]), "amount_usdt": r["amount_usdt"]}
+        for r in rows
+        if r["amount_usdt"] > 0
+    ]
+    return out_rows, incomplete
+
+
+async def refresh_kraken_cache_once(app: Application) -> None:
+    if not KRAKEN_CACHE["enabled"]:
+        return
+
+    should_refresh_panels = False
+    force_countdown_refresh = False
+    refresh_now = now_utc()
+
+    async with KRAKEN_REFRESH_LOCK:
+        before_block = _format_kraken_dashboard_block(_kraken_state_snapshot(), render_now=refresh_now)
+        KRAKEN_CACHE["last_attempt_at"] = now_utc_iso()
+
+        try:
+            payload = await asyncio.to_thread(_kraken_private_post_balance_ex_sync)
+            balance_usdt, tradable_usdt, locked_usdt = _extract_balance_split_usdt(payload)
+        except Exception as e:
+            had_success = KRAKEN_CACHE.get("last_success_at_balance") is not None
+            KRAKEN_CACHE["balance_status"] = "stale" if had_success else "error"
+            KRAKEN_CACHE["last_error_balance"] = str(e)[:200]
+            logger.warning("Kraken balance refresh failed: %s", KRAKEN_CACHE["last_error_balance"])
+        else:
+            KRAKEN_CACHE["balance_status"] = "ok"
+            KRAKEN_CACHE["balance_usdt"] = balance_usdt
+            KRAKEN_CACHE["tradable_usdt"] = tradable_usdt
+            KRAKEN_CACHE["locked_usdt"] = locked_usdt
+            KRAKEN_CACHE["last_success_at_balance"] = now_utc_iso()
+            KRAKEN_CACHE["last_error_balance"] = None
+            logger.info(
+                "Kraken %s refreshed balance=%s tradable=%s locked=%s",
+                KRAKEN_ASSET,
+                _format_kraken_amount_4(balance_usdt),
+                _format_kraken_amount_4(tradable_usdt),
+                _format_kraken_amount_4(locked_usdt),
+            )
+
+        current_locked = _kraken_decimal_or_none(KRAKEN_CACHE.get("locked_usdt"))
+        try:
+            events, hit_cap = await asyncio.to_thread(_fetch_usdt_ledger_events_with_pagination, refresh_now)
+            unlock_rows, incomplete = _estimate_unlock_rows_fifo(events, current_locked, refresh_now)
+        except Exception as e:
+            had_success = KRAKEN_CACHE.get("last_success_at_ledger") is not None
+            KRAKEN_CACHE["ledger_status"] = "stale" if had_success else "error"
+            KRAKEN_CACHE["last_error_ledger"] = str(e)[:200]
+            logger.warning("Kraken unlock estimate refresh failed: %s", KRAKEN_CACHE["last_error_ledger"])
+        else:
+            KRAKEN_CACHE["ledger_status"] = "ok"
+            KRAKEN_CACHE["unlock_rows"] = unlock_rows
+            KRAKEN_CACHE["last_success_at_ledger"] = now_utc_iso()
+            KRAKEN_CACHE["last_error_ledger"] = None
+
+            if hit_cap:
+                logger.warning(
+                    "Kraken ledger pagination cap hit (%s pages); unlock estimate may be incomplete",
+                    KRAKEN_LEDGER_MAX_PAGES,
+                )
+            elif incomplete:
+                logger.warning("Kraken unlock estimate may be incomplete (ledger-derived rows < current locked)")
+
+            if unlock_rows:
+                first = unlock_rows[0]
+                first_amt = _kraken_decimal_or_none(first.get("amount_usdt")) or Decimal("0")
+                logger.info(
+                    "Kraken unlock rows refreshed: count=%s next=%s +%s %s",
+                    len(unlock_rows),
+                    first.get("unlock_at_iso"),
+                    _format_kraken_amount_int_readable(first_amt),
+                    KRAKEN_ASSET,
+                )
+            else:
+                logger.info("Kraken unlock rows refreshed: count=0")
+
+        after_snapshot = _kraken_state_snapshot()
+        after_block = _format_kraken_dashboard_block(after_snapshot, render_now=refresh_now)
+        should_refresh_panels = after_block != before_block
+        locked_for_display = _kraken_decimal_or_none(after_snapshot.get("locked_usdt"))
+        force_countdown_refresh = bool(after_snapshot.get("unlock_rows")) and bool(
+            locked_for_display is not None and locked_for_display > 0
+        )
+
+    if should_refresh_panels or force_countdown_refresh:
+        try:
+            await update_all_panels_for_app(app)
+        except Exception:
+            logger.warning("Kraken-triggered panel refresh failed", exc_info=True)
+
+
+async def kraken_refresh_loop(app: Application) -> None:
+    logger.info(
+        "Kraken dashboard refresh loop started (asset=%s interval=%ss)",
+        KRAKEN_ASSET,
+        KRAKEN_REFRESH_SECONDS,
+    )
+    try:
+        while True:
+            try:
+                await refresh_kraken_cache_once(app)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Unexpected Kraken refresh loop error", exc_info=True)
+
+            await asyncio.sleep(KRAKEN_REFRESH_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("Kraken dashboard refresh loop stopped")
+        raise
+
+
+# =========================
 # UI BUILDERS
 # =========================
 
 def build_panel_text(total_cents: int) -> str:
     fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
+    kraken_block = _format_kraken_dashboard_block(_kraken_state_snapshot())
 
     pending = pending_confirmations_count()
     pending_block = ""
@@ -685,6 +1214,7 @@ def build_panel_text(total_cents: int) -> str:
             )
 
     return (
+        f"{kraken_block}\n\n"
         "光 ═════════════ 光\n\n"
         f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
         f"<b>費 Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
@@ -767,12 +1297,12 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
 # - If edit fails, we attempt to delete the old message (best-effort) and create a new one, updating the stored id.
 # This prevents "duplicate dashboards".
 
-async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup):
+async def edit_panel_for_app(chat_id: int, app: Application, text: str, reply_markup: InlineKeyboardMarkup):
     st = get_chat_state(chat_id)
     panel_message_id = st.get("panel_message_id")
 
     if not panel_message_id:
-        await send_or_update_panel(chat_id, context)
+        await send_or_update_panel_for_app(chat_id, app)
         return
 
     mode = st.get("panel_mode", "text")
@@ -780,7 +1310,7 @@ async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str
     # Try banner caption edit if we believe it's banner
     if mode == "banner" and BANNER_URL:
         try:
-            await context.bot.edit_message_caption(
+            await app.bot.edit_message_caption(
                 chat_id=chat_id,
                 message_id=panel_message_id,
                 caption=text,
@@ -793,7 +1323,7 @@ async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str
 
     # Try text edit
     try:
-        await context.bot.edit_message_text(
+        await app.bot.edit_message_text(
             chat_id=chat_id,
             message_id=panel_message_id,
             text=text,
@@ -805,7 +1335,7 @@ async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str
         # maybe it's actually a banner; try caption edit
         if BANNER_URL:
             try:
-                await context.bot.edit_message_caption(
+                await app.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=panel_message_id,
                     caption=text,
@@ -820,15 +1350,19 @@ async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str
     # If we get here, editing failed. To prevent duplicates:
     # best-effort delete old panel message, then create a fresh one and store its id.
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+        await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
     except Exception:
         pass
 
     set_panel_message_id(chat_id, None)
-    await send_or_update_panel(chat_id, context)
+    await send_or_update_panel_for_app(chat_id, app)
 
 
-async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup):
+    await edit_panel_for_app(chat_id, context.application, text=text, reply_markup=reply_markup)
+
+
+async def send_or_update_panel_for_app(chat_id: int, app: Application):
     st = get_chat_state(chat_id)
     g = get_global_state()
     total_cents = g["total_cents"]
@@ -839,13 +1373,13 @@ async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
     panel_message_id = st.get("panel_message_id")
     if panel_message_id:
         # Try edit; if it fails, edit_panel will delete & recreate
-        await edit_panel(chat_id, context, text=text, reply_markup=kb)
+        await edit_panel_for_app(chat_id, app, text=text, reply_markup=kb)
         return
 
     # Create new panel: banner if configured, otherwise text
     if BANNER_URL:
         try:
-            msg = await context.bot.send_photo(
+            msg = await app.bot.send_photo(
                 chat_id=chat_id,
                 photo=BANNER_URL,
                 caption=text,
@@ -858,7 +1392,7 @@ async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             set_panel_mode(chat_id, "text")
 
-    msg = await context.bot.send_message(
+    msg = await app.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=kb,
@@ -867,13 +1401,21 @@ async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
     set_panel_message_id(chat_id, msg.message_id)
 
 
-async def update_all_panels(context: ContextTypes.DEFAULT_TYPE):
+async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await send_or_update_panel_for_app(chat_id, context.application)
+
+
+async def update_all_panels_for_app(app: Application):
     # Update or create exactly one panel per participant
     for uid in get_participants():
         try:
-            await send_or_update_panel(uid, context)
+            await send_or_update_panel_for_app(uid, app)
         except Exception:
             logger.warning("panel update failed for user_id=%s", uid, exc_info=True)
+
+
+async def update_all_panels(context: ContextTypes.DEFAULT_TYPE):
+    await update_all_panels_for_app(context.application)
 
 
 # =========================
@@ -1362,6 +1904,32 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_app_init(app: Application):
+    global KRAKEN_REFRESH_TASK
+
+    if not KRAKEN_CACHE["enabled"]:
+        logger.info("Kraken balance dashboard line enabled in placeholder mode (missing Kraken API creds)")
+        return
+
+    if KRAKEN_REFRESH_TASK and not KRAKEN_REFRESH_TASK.done():
+        return
+
+    KRAKEN_REFRESH_TASK = app.create_task(kraken_refresh_loop(app))
+
+
+async def on_app_shutdown(app: Application):
+    global KRAKEN_REFRESH_TASK
+
+    task = KRAKEN_REFRESH_TASK
+    KRAKEN_REFRESH_TASK = None
+    if not task:
+        return
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN env var")
@@ -1376,7 +1944,13 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_app_init)
+        .post_shutdown(on_app_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
