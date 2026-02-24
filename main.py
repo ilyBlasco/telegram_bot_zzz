@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -25,6 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 FEE_PCT = Decimal(os.getenv("FEE_PCT", "0.02"))  # 2% default
 NETWORK_FEE = Decimal(os.getenv("NETWORK_FEE", "0.30"))  # $0.30 flat
 BANNER_URL = os.getenv("BANNER_URL", "").strip()  # optional public image URL
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
@@ -37,6 +39,11 @@ CONFIRM_WINDOW_SECONDS = 24 * 60 * 60
 
 # Per-user "waiting for custom amount" state (in-memory OK for one worker)
 AWAITING_CUSTOM_AMOUNT: set[int] = set()
+
+logger = logging.getLogger(__name__)
+
+# Serialize state-changing DB operations inside this single process.
+STATE_LOCK = asyncio.Lock()
 
 
 # =========================
@@ -337,6 +344,45 @@ def mark_confirmed(movement_id: int, confirmed_by: int):
         )
 
 
+def confirm_movement_tx(movement_id: int, confirmer_id: int) -> dict:
+    """
+    Atomically checks and confirms a movement confirmation record.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM confirmations WHERE movement_id = ?",
+            (movement_id,),
+        ).fetchone()
+
+        if not row:
+            return {"status": "missing"}
+
+        actor_id = int(row["actor_id"])
+        amount_cents = int(row["amount_cents"])
+
+        if int(row["is_confirmed"]) == 1:
+            return {
+                "status": "already_confirmed",
+                "actor_id": actor_id,
+                "amount_cents": amount_cents,
+            }
+
+        conn.execute(
+            """
+            UPDATE confirmations
+            SET is_confirmed = 1, confirmed_at = ?, confirmed_by = ?
+            WHERE movement_id = ?
+            """,
+            (now_utc_iso(), confirmer_id, movement_id),
+        )
+
+        return {
+            "status": "confirmed",
+            "actor_id": actor_id,
+            "amount_cents": amount_cents,
+        }
+
+
 def set_confirm_message_refs(movement_id: int, chat_id: int, message_id: int):
     with db() as conn:
         conn.execute(
@@ -373,20 +419,196 @@ async def cleanup_expired_confirmations(context: ContextTypes.DEFAULT_TYPE):
     Safe to call often.
     """
     now_iso = now_utc_iso()
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT movement_id
-            FROM confirmations
-            WHERE is_confirmed = 0 AND expires_at <= ?
-            """,
-            (now_iso,),
-        ).fetchall()
+    async with STATE_LOCK:
+        with db() as conn:
+            rows = conn.execute(
+                """
+                SELECT movement_id
+                FROM confirmations
+                WHERE is_confirmed = 0 AND expires_at <= ?
+                """,
+                (now_iso,),
+            ).fetchall()
 
-    for r in rows:
-        mid = int(r["movement_id"])
-        mark_confirmed(mid, confirmed_by=0)
+        mids = [int(r["movement_id"]) for r in rows]
+        for mid in mids:
+            mark_confirmed(mid, confirmed_by=0)
+
+    for mid in mids:
         await try_delete_confirm_message(context, mid)
+
+
+def add_amount_with_confirmation(actor_id: int, add_cents: int) -> tuple[int, int]:
+    """
+    Atomically updates total, logs the movement, and creates the confirmation row.
+    Returns (movement_id, new_total_cents).
+    """
+    created = now_utc()
+    created_iso = dt_to_iso(created)
+    expires_iso = dt_to_iso(created + timedelta(seconds=CONFIRM_WINDOW_SECONDS))
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT total_cents, session_id FROM global_state WHERE id = 1"
+        ).fetchone()
+        total_cents = int(row["total_cents"]) + add_cents
+        session_id = int(row["session_id"])
+
+        conn.execute("UPDATE global_state SET total_cents = ? WHERE id = 1", (total_cents,))
+
+        cur = conn.execute(
+            """
+            INSERT INTO movements(session_id, kind, amount_cents, total_after_cents, actor_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, "add", add_cents, total_cents, actor_id, created_iso),
+        )
+        movement_id = int(cur.lastrowid)
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO confirmations(
+                movement_id, actor_id, amount_cents, created_at, expires_at,
+                is_confirmed, confirmed_at, confirmed_by, confirm_chat_id, confirm_message_id
+            ) VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL)
+            """,
+            (movement_id, actor_id, add_cents, created_iso, expires_iso),
+        )
+
+    return movement_id, total_cents
+
+
+def release_current_total(actor_id: int) -> dict | None:
+    """
+    Atomically records a release, logs it, and resets the running total/session.
+    Returns release summary data or None if total <= 0.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT total_cents, session_id FROM global_state WHERE id = 1"
+        ).fetchone()
+        total_cents = int(row["total_cents"])
+        session_id = int(row["session_id"])
+
+        if total_cents <= 0:
+            return None
+
+        fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
+        ts = now_utc_iso()
+
+        conn.execute(
+            """
+            INSERT INTO releases(session_id, released_total_cents, fee_cents, network_fee_cents, net_cents, released_by, released_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, total_cents, fee_cents, network_fee_cents, net_cents, actor_id, ts),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO movements(session_id, kind, amount_cents, total_after_cents, actor_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, "release", total_cents, 0, actor_id, ts),
+        )
+
+        conn.execute(
+            "UPDATE global_state SET total_cents = 0, session_id = ? WHERE id = 1",
+            (session_id + 1,),
+        )
+
+    return {
+        "session_id": session_id,
+        "total_cents": total_cents,
+        "fee_cents": fee_cents,
+        "network_fee_cents": network_fee_cents,
+        "net_cents": net_cents,
+    }
+
+
+def undo_last_movement_tx() -> dict | None:
+    """
+    Atomically undoes the latest movement and returns metadata for notifications/UI.
+    """
+    with db() as conn:
+        last = conn.execute(
+            """
+            SELECT id, session_id, kind, amount_cents, total_after_cents, actor_id, created_at
+            FROM movements
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not last:
+            return None
+
+        last_kind = str(last["kind"])
+        last_amount = int(last["amount_cents"])
+        last_session = int(last["session_id"])
+        last_id = int(last["id"])
+
+        g = conn.execute(
+            "SELECT total_cents, session_id FROM global_state WHERE id = 1"
+        ).fetchone()
+        current_total = int(g["total_cents"])
+        current_session = int(g["session_id"])
+
+        if last_kind == "add":
+            if current_session != last_session:
+                conn.execute("UPDATE global_state SET session_id = ? WHERE id = 1", (last_session,))
+
+            new_total = current_total - last_amount
+            if new_total < 0:
+                new_total = 0
+
+            conf = conn.execute(
+                """
+                SELECT confirm_chat_id, confirm_message_id
+                FROM confirmations
+                WHERE movement_id = ?
+                """,
+                (last_id,),
+            ).fetchone()
+
+            conn.execute("DELETE FROM confirmations WHERE movement_id = ?", (last_id,))
+            conn.execute("UPDATE global_state SET total_cents = ? WHERE id = 1", (new_total,))
+            conn.execute("DELETE FROM movements WHERE id = ?", (last_id,))
+
+            return {
+                "kind": "add",
+                "amount_cents": last_amount,
+                "new_total_cents": new_total,
+                "confirm_chat_id": int(conf["confirm_chat_id"]) if conf and conf["confirm_chat_id"] else None,
+                "confirm_message_id": int(conf["confirm_message_id"]) if conf and conf["confirm_message_id"] else None,
+            }
+
+        if last_kind == "release":
+            conn.execute(
+                "UPDATE global_state SET session_id = ?, total_cents = ? WHERE id = 1",
+                (last_session, last_amount),
+            )
+
+            row = conn.execute(
+                """
+                SELECT id FROM releases
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (last_session,),
+            ).fetchone()
+            if row:
+                conn.execute("DELETE FROM releases WHERE id = ?", (row["id"],))
+
+            conn.execute("DELETE FROM movements WHERE id = ?", (last_id,))
+
+            return {
+                "kind": "release",
+                "restored_total_cents": last_amount,
+                "restored_session_id": last_session,
+            }
+
+        return {"kind": "unknown"}
 
 
 # =========================
@@ -519,7 +741,12 @@ async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message
         await asyncio.sleep(seconds)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
-        pass
+        logger.debug(
+            "delete_later failed for chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+            exc_info=True,
+        )
 
 
 async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -529,7 +756,7 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
             msg = await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
             context.application.create_task(delete_later(context, uid, msg.message_id, NOTIFY_DELETE_SECONDS))
         except Exception:
-            pass
+            logger.warning("notify failed for participant user_id=%s", uid, exc_info=True)
 
 
 # =========================
@@ -646,7 +873,7 @@ async def update_all_panels(context: ContextTypes.DEFAULT_TYPE):
         try:
             await send_or_update_panel(uid, context)
         except Exception:
-            pass
+            logger.warning("panel update failed for user_id=%s", uid, exc_info=True)
 
 
 # =========================
@@ -680,14 +907,20 @@ async def send_confirmation_request_to_confirmer(
         # best-effort delete at 24h (also cleaned on interactions)
         context.application.create_task(delete_later(context, confirmer_id, msg.message_id, CONFIRM_WINDOW_SECONDS))
     except Exception:
-        pass
+        logger.warning(
+            "failed to send confirmation request movement_id=%s confirmer_id=%s actor_id=%s",
+            movement_id,
+            confirmer_id,
+            actor_id,
+            exc_info=True,
+        )
 
 
 # =========================
 # UNDO
 # =========================
 
-async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _undo_last_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_expired_confirmations(context)
 
     last = get_last_movement()
@@ -759,6 +992,59 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
 
 
+# Transactional undo implementation (overrides legacy helper above).
+async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cleanup_expired_confirmations(context)
+
+    async with STATE_LOCK:
+        result = undo_last_movement_tx()
+
+    if not result:
+        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer lol.")
+        return
+
+    if result["kind"] == "add":
+        chat_id = result.get("confirm_chat_id")
+        msg_id = result.get("confirm_message_id")
+        if chat_id and msg_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                logger.debug(
+                    "failed to delete confirmation message chat_id=%s message_id=%s",
+                    chat_id,
+                    msg_id,
+                    exc_info=True,
+                )
+
+        await notify(
+            context,
+            (
+                "<b>Yozu Tracker</b>\n"
+                "<b>⏪ Control + Z</b>\n"
+                f"Se deshizo: <code>${cents_to_money_str(int(result['amount_cents']))}</code>\n"
+                f"Total: <code>${cents_to_money_str(int(result['new_total_cents']))}</code>"
+            ),
+        )
+        await update_all_panels(context)
+        return
+
+    if result["kind"] == "release":
+        await notify(
+            context,
+            (
+                "<b>Yozu Tracker</b>\n"
+                "<b>⏪ Control + Z</b>\n"
+                "Se deshizo un <b>Release</b>.\n"
+                f"Total restaurado: <code>${cents_to_money_str(int(result['restored_total_cents']))}</code>"
+            ),
+        )
+        await update_all_panels(context)
+        return
+
+    await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
+
+
 # =========================
 # START
 # =========================
@@ -808,13 +1094,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_amount = data.split(":", 1)[1]
         add_cents = money_to_cents(add_amount)
 
-        g = get_global_state()
-        total_cents = g["total_cents"] + add_cents
-        set_global_total(total_cents)
-
-        movement_id = log_movement("add", add_cents, total_cents, user.id)
-
-        create_confirmation_for_movement(movement_id, user.id, add_cents)
+        async with STATE_LOCK:
+            movement_id, total_cents = add_amount_with_confirmation(user.id, add_cents)
 
         await notify(
             context,
@@ -864,8 +1145,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return
 
-        row = get_confirmation(movement_id)
-        if not row:
+        async with STATE_LOCK:
+            confirm_result = confirm_movement_tx(movement_id, user.id)
+
+        status = confirm_result["status"]
+        if status == "missing":
             try:
                 await query.edit_message_text("Confirmación ya no existe.", parse_mode=ParseMode.HTML)
             except Exception:
@@ -873,16 +1157,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_all_panels(context)
             return
 
-        if int(row["is_confirmed"]) == 1:
+        if status == "already_confirmed":
             await try_delete_confirm_message(context, movement_id)
             await update_all_panels(context)
             return
 
-        mark_confirmed(movement_id, confirmed_by=user.id)
         await try_delete_confirm_message(context, movement_id)
 
-        amount_cents = int(row["amount_cents"])
-        actor_id = int(row["actor_id"])
+        amount_cents = int(confirm_result["amount_cents"])
+        actor_id = int(confirm_result["actor_id"])
 
         # Notify actor (auto-delete normal)
         if actor_id != user.id:
@@ -901,13 +1184,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update_all_panels(context)
         return
-
     if data == "release":
-        g = get_global_state()
-        total_cents = g["total_cents"]
-        session_id = g["session_id"]
+        async with STATE_LOCK:
+            release_info = release_current_total(user.id)
 
-        if total_cents <= 0:
+        if not release_info:
             # Non-toxic, stable behavior: do nothing besides notifying
             await notify(
                 context,
@@ -916,18 +1197,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_all_panels(context)
             return
 
-        fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
-
-        with db() as conn:
-            conn.execute(
-                """
-                INSERT INTO releases(session_id, released_total_cents, fee_cents, network_fee_cents, net_cents, released_by, released_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (session_id, total_cents, fee_cents, network_fee_cents, net_cents, user.id, now_utc_iso()),
-            )
-
-        log_movement("release", total_cents, 0, user.id)
+        total_cents = int(release_info["total_cents"])
+        fee_cents = int(release_info["fee_cents"])
+        network_fee_cents = int(release_info["network_fee_cents"])
+        net_cents = int(release_info["net_cents"])
 
         await notify(
             context,
@@ -941,8 +1214,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
 
-        set_global_total(0)
-        set_global_session(session_id + 1)
         AWAITING_CUSTOM_AMOUNT.discard(user.id)
 
         # Show release summary in the current chat panel momentarily, then back
@@ -1046,13 +1317,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     AWAITING_CUSTOM_AMOUNT.discard(user.id)
 
-    g = get_global_state()
-    total_cents = g["total_cents"] + add_cents
-    set_global_total(total_cents)
-
-    movement_id = log_movement("add", add_cents, total_cents, user.id)
-
-    create_confirmation_for_movement(movement_id, user.id, add_cents)
+    async with STATE_LOCK:
+        movement_id, total_cents = add_amount_with_confirmation(user.id, add_cents)
 
     await notify(
         context,
@@ -1083,9 +1349,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =========================
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if err is None:
+        logger.error("Unhandled Telegram error (no exception object)")
+        return
+
+    logger.error(
+        "Unhandled Telegram error: %s",
+        err,
+        exc_info=(type(err), err, err.__traceback__),
+    )
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN env var")
+
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     init_db()
 
@@ -1094,9 +1378,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+
+
