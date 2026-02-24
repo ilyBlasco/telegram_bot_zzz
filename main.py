@@ -43,9 +43,20 @@ KRAKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("KRAKEN_TIMEOUT_SECONDS", "10")))
 KRAKEN_ASSET = (os.getenv("KRAKEN_ASSET", "USDT").strip().upper() or "USDT")
 KRAKEN_HOLD_DAYS = max(1, int(os.getenv("KRAKEN_HOLD_DAYS", "8")))
 KRAKEN_LEDGER_MAX_PAGES = max(1, int(os.getenv("KRAKEN_LEDGER_MAX_PAGES", "10")))
+_KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE = "ui" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "off"
+KRAKEN_DEPOSIT_ESTIMATOR_MODE = (
+    os.getenv("KRAKEN_DEPOSIT_ESTIMATOR_MODE", _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE).strip().lower()
+    or _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE
+)
+if KRAKEN_DEPOSIT_ESTIMATOR_MODE not in {"off", "shadow", "ui"}:
+    KRAKEN_DEPOSIT_ESTIMATOR_MODE = _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE
+KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT", "50")))
+KRAKEN_DEPOSIT_STATUS_MAX_PAGES = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_MAX_PAGES", "10")))
+KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS", "14")))
 KRAKEN_API_BASE = "https://api.kraken.com"
 KRAKEN_BALANCE_EX_PATH = "/0/private/BalanceEx"
 KRAKEN_LEDGERS_PATH = "/0/private/Ledgers"
+KRAKEN_DEPOSIT_STATUS_PATH = "/0/private/DepositStatus"
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
@@ -81,6 +92,11 @@ KRAKEN_CACHE: dict = {
     "last_attempt_at": None,
     "last_error_balance": None,
     "last_error_ledger": None,
+    "deposit_estimator_status": "disabled",
+    "deposit_hold_rows_usd": [],  # list[dict[str, Decimal|str]]
+    "deposit_hold_total_usd": None,  # Decimal | None
+    "last_success_at_deposit_status": None,
+    "last_error_deposit_status": None,
 }
 
 
@@ -707,6 +723,7 @@ def delete_latest_release_for_session(session_id: int):
 def _kraken_state_snapshot() -> dict:
     snap = dict(KRAKEN_CACHE)
     snap["unlock_rows"] = [dict(row) for row in (KRAKEN_CACHE.get("unlock_rows") or [])]
+    snap["deposit_hold_rows_usd"] = [dict(row) for row in (KRAKEN_CACHE.get("deposit_hold_rows_usd") or [])]
     return snap
 
 
@@ -730,6 +747,25 @@ def _format_kraken_amount_int_readable(value: Decimal) -> str:
     if value < 0 and value > -1:
         return ">-1"
     return str(int(value))
+
+
+def _format_usd_est_amount_int(value: Decimal | None) -> str:
+    if value is None:
+        return "--"
+    if value > 0 and value < 1:
+        return "<$1"
+    if value < 0 and value > -1:
+        return ">-$1"
+    sign = "-" if value < 0 else ""
+    return f"{sign}${int(abs(value))}"
+
+
+def _format_usd_row_amount(value: Decimal | None) -> str:
+    if value is None or value <= 0:
+        return "+$0"
+    if value < 1:
+        return "+<$1"
+    return f"+${int(value)}"
 
 
 def _parse_iso_utc_or_none(s: str | None) -> datetime | None:
@@ -779,8 +815,43 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
 
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
+    lines = [f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"]
 
-    return f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"
+    if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
+        return "\n".join(lines)
+
+    deposit_status = str(snapshot.get("deposit_estimator_status") or "")
+    if deposit_status not in {"ok", "stale"}:
+        return "\n".join(lines)
+
+    deposit_rows = snapshot.get("deposit_hold_rows_usd") or []
+    row_lines: list[str] = []
+    active_total = Decimal("0")
+    for row in deposit_rows:
+        amount_usd = _kraken_decimal_or_none(row.get("amount_usd"))
+        unlock_at = _parse_iso_utc_or_none(row.get("unlock_at_iso"))
+        if amount_usd is None or amount_usd <= 0 or unlock_at is None or unlock_at <= render_now:
+            continue
+        active_total += amount_usd
+        row_lines.append(
+            f"<i>{_format_usd_row_amount(amount_usd)} · "
+            f"{_format_countdown_short(render_now, unlock_at)} · {_format_utc_short(unlock_at)}</i>"
+        )
+
+    if not row_lines:
+        return "\n".join(lines)
+
+    total_usd = _kraken_decimal_or_none(snapshot.get("deposit_hold_total_usd"))
+    if total_usd is None or total_usd <= 0:
+        total_usd = active_total
+
+    if deposit_status == "stale":
+        lines.append("<i>⚠ Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
+
+    lines.append(f"<i>KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
+    lines.append("<i>UNLOCKS [EST USD]:</i>")
+    lines.extend(row_lines)
+    return "\n".join(lines)
 
 
 def _kraken_sign(url_path: str, nonce: str, postdata: str, api_secret_b64: str) -> str:
@@ -841,8 +912,8 @@ def _kraken_private_post_sync(url_path: str, extra_form: dict | None = None) -> 
             raise RuntimeError("Kraken API key requires OTP/2FA (unsupported)")
         raise RuntimeError(f"Kraken API error: {msg}")
 
-    if not isinstance(payload.get("result"), dict):
-        raise RuntimeError("Kraken response missing result object")
+    if "result" not in payload:
+        raise RuntimeError("Kraken response missing result")
 
     return payload
 
@@ -853,6 +924,15 @@ def _kraken_private_post_balance_ex_sync() -> dict:
 
 def _kraken_private_post_ledgers_sync(ofs: int = 0) -> dict:
     return _kraken_private_post_sync(KRAKEN_LEDGERS_PATH, {"asset": KRAKEN_ASSET, "ofs": ofs})
+
+
+def _kraken_private_post_deposit_status_sync(cursor: str | None = None, limit: int | None = None) -> dict:
+    form: dict[str, str | int] = {}
+    if cursor:
+        form["cursor"] = cursor
+    if limit is not None:
+        form["limit"] = int(limit)
+    return _kraken_private_post_sync(KRAKEN_DEPOSIT_STATUS_PATH, form)
 
 
 def _extract_balance_split_usdt(payload: dict) -> tuple[Decimal, Decimal, Decimal]:
@@ -896,6 +976,234 @@ def _extract_balance_split_usdt(payload: dict) -> tuple[Decimal, Decimal, Decima
         locked = Decimal("0")
 
     return balance, tradable, locked
+
+
+def _kraken_parse_time_any(value) -> datetime | None:
+    if value in (None, ""):
+        return None
+
+    # Numeric epoch timestamps (seconds or milliseconds).
+    try:
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        text = str(value).strip()
+        if text and text.replace(".", "", 1).isdigit():
+            ts = float(text)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        pass
+
+    # ISO-ish timestamps.
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _kraken_extract_result_items_and_cursor(payload: dict) -> tuple[list, str | None]:
+    result = payload.get("result")
+
+    if isinstance(result, list):
+        next_cursor = payload.get("next_cursor") or payload.get("cursor")
+        return result, str(next_cursor) if next_cursor else None
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Kraken DepositStatus result has unsupported shape")
+
+    items = None
+    for key in ("deposits", "items", "data", "entries", "records"):
+        candidate = result.get(key)
+        if isinstance(candidate, list):
+            items = candidate
+            break
+
+    if items is None:
+        dict_values = list(result.values())
+        if dict_values and all(isinstance(v, dict) for v in dict_values):
+            # Legacy map-style shape keyed by id/ref.
+            items = dict_values
+
+    next_cursor = None
+    for key in ("next_cursor", "nextCursor", "cursor", "next-cursor"):
+        if result.get(key):
+            next_cursor = result.get(key)
+            break
+    if next_cursor is None:
+        for container_key in ("meta", "pagination", "page_info"):
+            container = result.get(container_key)
+            if not isinstance(container, dict):
+                continue
+            for key in ("next_cursor", "nextCursor", "cursor", "endCursor"):
+                if container.get(key):
+                    next_cursor = container.get(key)
+                    break
+            if next_cursor is not None:
+                break
+
+    if items is None:
+        # Empty/metadata-only responses are valid.
+        metadata_keys = {
+            "count",
+            "cursor",
+            "next_cursor",
+            "nextCursor",
+            "meta",
+            "pagination",
+            "page_info",
+        }
+        if not result or set(result.keys()).issubset(metadata_keys):
+            items = []
+        else:
+            raise RuntimeError(
+                "Kraken DepositStatus result missing items list (keys: %s)"
+                % ",".join(sorted(str(k) for k in result.keys()))
+            )
+
+    return items, str(next_cursor) if next_cursor else None
+
+
+def _extract_usd_deposit_events(payload: dict) -> tuple[list[dict], str | None]:
+    items, next_cursor = _kraken_extract_result_items_and_cursor(payload)
+    events: list[dict] = []
+
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+
+        asset = str(item.get("asset") or item.get("aclass") or item.get("currency") or "").upper()
+        if asset not in {"USD", "ZUSD"}:
+            continue
+
+        amount = _kraken_decimal_or_none(
+            item.get("amount")
+            if item.get("amount") is not None
+            else item.get("amount_usd")
+            if item.get("amount_usd") is not None
+            else item.get("volume")
+            if item.get("volume") is not None
+            else item.get("vol")
+        )
+        if amount is None or amount <= 0:
+            continue
+
+        raw_status = str(
+            item.get("status_name")
+            or item.get("status_string")
+            or item.get("status")
+            or item.get("state")
+            or ""
+        ).strip()
+        status_norm = raw_status.lower()
+        if status_norm:
+            if any(x in status_norm for x in ("fail", "error", "cancel", "reject", "denied", "pending", "initiated")):
+                continue
+            if not any(x in status_norm for x in ("success", "complete", "credited", "settled")):
+                # Unknown status string; skip to avoid overstating held funds.
+                continue
+
+        processed_at = None
+        for key in (
+            "processed_time",
+            "processedAt",
+            "processed_at",
+            "completed_time",
+            "completedAt",
+            "time",
+            "accepted_time",
+            "acceptedAt",
+            "request_time",
+            "created_time",
+            "createdAt",
+        ):
+            processed_at = _kraken_parse_time_any(item.get(key))
+            if processed_at is not None:
+                break
+        if processed_at is None:
+            continue
+
+        events.append(
+            {
+                "id": str(item.get("id") or item.get("refid") or item.get("txid") or idx),
+                "asset": asset,
+                "method": str(item.get("method") or item.get("method_name") or item.get("network") or ""),
+                "status": raw_status or "unknown",
+                "amount_usd": amount,
+                "processed_at": processed_at,
+            }
+        )
+
+    return events, next_cursor
+
+
+def _fetch_usd_deposit_events_with_pagination(fetch_now: datetime) -> tuple[list[dict], bool]:
+    cutoff = fetch_now - timedelta(days=KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS)
+    cursor: str | None = None
+    all_events: list[dict] = []
+    hit_cap = True
+
+    for _ in range(KRAKEN_DEPOSIT_STATUS_MAX_PAGES):
+        payload = _kraken_private_post_deposit_status_sync(
+            cursor=cursor,
+            limit=KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT,
+        )
+        page_events, next_cursor = _extract_usd_deposit_events(payload)
+        all_events.extend(page_events)
+
+        oldest_page_time = None
+        for ev in page_events:
+            t = ev.get("processed_at")
+            if isinstance(t, datetime) and (oldest_page_time is None or t < oldest_page_time):
+                oldest_page_time = t
+
+        if oldest_page_time is not None and oldest_page_time <= cutoff:
+            hit_cap = False
+            break
+        if not next_cursor or next_cursor == cursor:
+            hit_cap = False
+            break
+
+        cursor = next_cursor
+
+    all_events.sort(key=lambda e: (e["processed_at"], e.get("id") or ""))
+    return all_events, hit_cap
+
+
+def _estimate_usd_hold_rows_from_deposits(events: list[dict], now_dt: datetime) -> list[dict]:
+    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS)
+    rows_by_minute: dict[str, dict] = {}
+
+    for ev in events:
+        processed_at = ev.get("processed_at")
+        amount_usd = _kraken_decimal_or_none(ev.get("amount_usd"))
+        if not isinstance(processed_at, datetime) or amount_usd is None or amount_usd <= 0:
+            continue
+
+        unlock_at = processed_at + hold_delta
+        if unlock_at <= now_dt:
+            continue
+
+        minute_dt = unlock_at.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        minute_key = dt_to_iso(minute_dt)
+        row = rows_by_minute.get(minute_key)
+        if row is None:
+            row = {"unlock_at": minute_dt, "amount_usd": Decimal("0")}
+            rows_by_minute[minute_key] = row
+        row["amount_usd"] += amount_usd
+
+    rows = sorted(rows_by_minute.values(), key=lambda r: r["unlock_at"])
+    return [
+        {"unlock_at_iso": dt_to_iso(r["unlock_at"]), "amount_usd": r["amount_usd"]}
+        for r in rows
+        if r["amount_usd"] > 0
+    ]
 
 
 def _extract_usdt_ledger_events(payload: dict) -> list[dict]:
@@ -1042,6 +1350,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
         return
 
     should_refresh_panels = False
+    force_countdown_refresh = False
     refresh_now = now_utc()
 
     async with KRAKEN_REFRESH_LOCK:
@@ -1080,11 +1389,74 @@ async def refresh_kraken_cache_once(app: Application) -> None:
         KRAKEN_CACHE["unlock_rows"] = []
         KRAKEN_CACHE["last_error_ledger"] = None
 
+        if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "off":
+            KRAKEN_CACHE["deposit_estimator_status"] = "disabled"
+            KRAKEN_CACHE["deposit_hold_rows_usd"] = []
+            KRAKEN_CACHE["deposit_hold_total_usd"] = None
+            KRAKEN_CACHE["last_error_deposit_status"] = None
+        else:
+            try:
+                deposit_events, hit_cap = await asyncio.to_thread(
+                    _fetch_usd_deposit_events_with_pagination,
+                    refresh_now,
+                )
+                deposit_hold_rows_usd = _estimate_usd_hold_rows_from_deposits(deposit_events, refresh_now)
+                deposit_hold_total_usd = sum(
+                    (
+                        _kraken_decimal_or_none(row.get("amount_usd")) or Decimal("0")
+                        for row in deposit_hold_rows_usd
+                    ),
+                    Decimal("0"),
+                )
+            except Exception as e:
+                had_success = KRAKEN_CACHE.get("last_success_at_deposit_status") is not None
+                KRAKEN_CACHE["deposit_estimator_status"] = "stale" if had_success else "error"
+                KRAKEN_CACHE["last_error_deposit_status"] = str(e)[:200]
+                logger.warning(
+                    "Kraken deposit hold estimate refresh failed: %s",
+                    KRAKEN_CACHE["last_error_deposit_status"],
+                )
+                if not had_success:
+                    KRAKEN_CACHE["deposit_hold_rows_usd"] = []
+                    KRAKEN_CACHE["deposit_hold_total_usd"] = None
+            else:
+                KRAKEN_CACHE["deposit_estimator_status"] = "ok"
+                KRAKEN_CACHE["deposit_hold_rows_usd"] = deposit_hold_rows_usd
+                KRAKEN_CACHE["deposit_hold_total_usd"] = deposit_hold_total_usd
+                KRAKEN_CACHE["last_success_at_deposit_status"] = now_utc_iso()
+                KRAKEN_CACHE["last_error_deposit_status"] = None
+
+                if hit_cap:
+                    logger.warning(
+                        "Kraken DepositStatus pagination cap hit (%s pages); hold estimate may be incomplete",
+                        KRAKEN_DEPOSIT_STATUS_MAX_PAGES,
+                    )
+
+                if deposit_hold_rows_usd:
+                    first = deposit_hold_rows_usd[0]
+                    logger.info(
+                        "Kraken deposit hold estimate refreshed: deposits=%s active_rows=%s hold_total=%s next=%s %s",
+                        len(deposit_events),
+                        len(deposit_hold_rows_usd),
+                        _format_usd_est_amount_int(deposit_hold_total_usd),
+                        first.get("unlock_at_iso"),
+                        _format_usd_row_amount(_kraken_decimal_or_none(first.get("amount_usd"))),
+                    )
+                else:
+                    logger.info(
+                        "Kraken deposit hold estimate refreshed: deposits=%s active_rows=0 hold_total=$0",
+                        len(deposit_events),
+                    )
+
         after_snapshot = _kraken_state_snapshot()
         after_block = _format_kraken_dashboard_block(after_snapshot, render_now=refresh_now)
         should_refresh_panels = after_block != before_block
+        if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "ui":
+            deposit_status = str(after_snapshot.get("deposit_estimator_status") or "")
+            has_rows = bool(after_snapshot.get("deposit_hold_rows_usd"))
+            force_countdown_refresh = deposit_status in {"ok", "stale"} and has_rows
 
-    if should_refresh_panels:
+    if should_refresh_panels or force_countdown_refresh:
         try:
             await update_all_panels_for_app(app)
         except Exception:
