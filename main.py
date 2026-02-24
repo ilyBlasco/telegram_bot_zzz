@@ -13,6 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -53,6 +54,14 @@ if KRAKEN_DEPOSIT_ESTIMATOR_MODE not in {"off", "shadow", "ui"}:
 KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_PAGE_LIMIT", "50")))
 KRAKEN_DEPOSIT_STATUS_MAX_PAGES = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_MAX_PAGES", "10")))
 KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS = max(1, int(os.getenv("KRAKEN_DEPOSIT_STATUS_LOOKBACK_DAYS", "14")))
+KRAKEN_DISPLAY_TZ = os.getenv("KRAKEN_DISPLAY_TZ", "America/Chicago").strip() or "America/Chicago"
+_KRAKEN_DEPOSIT_TIME_ANCHOR_ALLOWED = {"auto", "processed", "completed", "accepted", "time", "request", "created"}
+_KRAKEN_DEPOSIT_TIME_ANCHOR_RAW = (os.getenv("KRAKEN_DEPOSIT_TIME_ANCHOR", "auto").strip().lower() or "auto")
+KRAKEN_DEPOSIT_TIME_ANCHOR = _KRAKEN_DEPOSIT_TIME_ANCHOR_RAW
+_KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID = False
+if KRAKEN_DEPOSIT_TIME_ANCHOR not in _KRAKEN_DEPOSIT_TIME_ANCHOR_ALLOWED:
+    KRAKEN_DEPOSIT_TIME_ANCHOR = "auto"
+    _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID = True
 KRAKEN_API_BASE = "https://api.kraken.com"
 KRAKEN_BALANCE_EX_PATH = "/0/private/BalanceEx"
 KRAKEN_LEDGERS_PATH = "/0/private/Ledgers"
@@ -76,6 +85,9 @@ logger = logging.getLogger(__name__)
 STATE_LOCK = asyncio.Lock()
 KRAKEN_REFRESH_LOCK = asyncio.Lock()
 KRAKEN_REFRESH_TASK: asyncio.Task | None = None
+_KRAKEN_DISPLAY_TZINFO = None
+_KRAKEN_DISPLAY_TZ_WARNED = False
+_KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED = False
 
 KRAKEN_CACHE: dict = {
     "enabled": bool(KRAKEN_API_KEY and KRAKEN_API_SECRET),
@@ -785,6 +797,28 @@ def _format_utc_short(dt: datetime) -> str:
     return f"{dt_utc.strftime('%b')} {dt_utc.day} {dt_utc.strftime('%H:%M')} UTC"
 
 
+def _get_kraken_display_tzinfo():
+    global _KRAKEN_DISPLAY_TZINFO, _KRAKEN_DISPLAY_TZ_WARNED
+    if _KRAKEN_DISPLAY_TZINFO is not None:
+        return _KRAKEN_DISPLAY_TZINFO
+    try:
+        _KRAKEN_DISPLAY_TZINFO = ZoneInfo(KRAKEN_DISPLAY_TZ)
+    except Exception:
+        _KRAKEN_DISPLAY_TZINFO = timezone.utc
+        if not _KRAKEN_DISPLAY_TZ_WARNED:
+            _KRAKEN_DISPLAY_TZ_WARNED = True
+            logger.warning("Invalid KRAKEN_DISPLAY_TZ '%s'; falling back to UTC", KRAKEN_DISPLAY_TZ)
+    return _KRAKEN_DISPLAY_TZINFO
+
+
+def _format_kraken_display_time_short(dt: datetime) -> str:
+    local_dt = dt.astimezone(_get_kraken_display_tzinfo())
+    hour_12 = local_dt.hour % 12 or 12
+    ampm = "AM" if local_dt.hour < 12 else "PM"
+    tz_label = local_dt.tzname() or "UTC"
+    return f"{local_dt.strftime('%b')} {local_dt.day} {hour_12}:{local_dt.strftime('%M')} {ampm} {tz_label}"
+
+
 def _format_countdown_short(now_dt: datetime, target_dt: datetime) -> str:
     delta_seconds = int((target_dt - now_dt).total_seconds())
     if delta_seconds <= 0:
@@ -834,19 +868,23 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
             continue
         active_total += amount_usd
         row_lines.append(
-            f"<i>{_format_usd_row_amount(amount_usd)} · "
-            f"{_format_countdown_short(render_now, unlock_at)} · {_format_utc_short(unlock_at)}</i>"
+            f"<i>{_format_usd_row_amount(amount_usd)} &middot; "
+            f"{_format_countdown_short(render_now, unlock_at)} &middot; {_format_kraken_display_time_short(unlock_at)}</i>"
         )
+
+    total_usd = active_total
+
+    if balance is not None:
+        est_tradable = balance - total_usd
+        if est_tradable < 0:
+            est_tradable = Decimal("0")
+        lines.append(f"<b>KRAKEN TRADABLE [EST]: {_format_kraken_amount_4(est_tradable)} (USDT)</b>")
 
     if not row_lines:
         return "\n".join(lines)
 
-    total_usd = _kraken_decimal_or_none(snapshot.get("deposit_hold_total_usd"))
-    if total_usd is None or total_usd <= 0:
-        total_usd = active_total
-
     if deposit_status == "stale":
-        lines.append("<i>⚠ Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
+        lines.append("<i>&#9888; Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
 
     lines.append(f"<i>KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
     lines.append("<i>UNLOCKS [EST USD]:</i>")
@@ -1109,23 +1147,33 @@ def _extract_usd_deposit_events(payload: dict) -> tuple[list[dict], str | None]:
                 # Unknown status string; skip to avoid overstating held funds.
                 continue
 
+        time_key_groups = {
+            "processed": ("processed_time", "processedAt", "processed_at"),
+            "completed": ("completed_time", "completedAt", "completed_at"),
+            "accepted": ("accepted_time", "acceptedAt", "accepted_at"),
+            "time": ("time",),
+            "request": ("request_time", "requestAt", "request_at"),
+            "created": ("created_time", "createdAt", "created_at"),
+        }
+        candidates: dict[str, datetime] = {}
+        for group_name, keys in time_key_groups.items():
+            for key in keys:
+                parsed = _kraken_parse_time_any(item.get(key))
+                if parsed is not None:
+                    candidates[group_name] = parsed
+                    break
+
         processed_at = None
-        for key in (
-            "processed_time",
-            "processedAt",
-            "processed_at",
-            "completed_time",
-            "completedAt",
-            "time",
-            "accepted_time",
-            "acceptedAt",
-            "request_time",
-            "created_time",
-            "createdAt",
-        ):
-            processed_at = _kraken_parse_time_any(item.get(key))
-            if processed_at is not None:
-                break
+        processed_at_source = None
+        if KRAKEN_DEPOSIT_TIME_ANCHOR != "auto":
+            processed_at = candidates.get(KRAKEN_DEPOSIT_TIME_ANCHOR)
+            processed_at_source = KRAKEN_DEPOSIT_TIME_ANCHOR if processed_at is not None else None
+        if processed_at is None:
+            for source_name in ("processed", "completed", "accepted", "time", "request", "created"):
+                if source_name in candidates:
+                    processed_at = candidates[source_name]
+                    processed_at_source = source_name
+                    break
         if processed_at is None:
             continue
 
@@ -1137,6 +1185,7 @@ def _extract_usd_deposit_events(payload: dict) -> tuple[list[dict], str | None]:
                 "status": raw_status or "unknown",
                 "amount_usd": amount,
                 "processed_at": processed_at,
+                "processed_at_source": processed_at_source or "unknown",
             }
         )
 
@@ -1346,8 +1395,15 @@ def _estimate_unlock_rows_fifo(events: list[dict], now_dt: datetime) -> list[dic
 
 
 async def refresh_kraken_cache_once(app: Application) -> None:
+    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED
     if not KRAKEN_CACHE["enabled"]:
         return
+    if _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID and not _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED:
+        _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED = True
+        logger.warning(
+            "Invalid KRAKEN_DEPOSIT_TIME_ANCHOR '%s'; falling back to 'auto'",
+            _KRAKEN_DEPOSIT_TIME_ANCHOR_RAW,
+        )
 
     should_refresh_panels = False
     force_countdown_refresh = False
@@ -1446,6 +1502,17 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                     logger.info(
                         "Kraken deposit hold estimate refreshed: deposits=%s active_rows=0 hold_total=$0",
                         len(deposit_events),
+                    )
+
+                source_counts: dict[str, int] = {}
+                for ev in deposit_events:
+                    src = str(ev.get("processed_at_source") or "unknown")
+                    source_counts[src] = source_counts.get(src, 0) + 1
+                if source_counts:
+                    logger.info(
+                        "Kraken deposit timestamp sources used (anchor=%s): %s",
+                        KRAKEN_DEPOSIT_TIME_ANCHOR,
+                        ", ".join(f"{k}={source_counts[k]}" for k in sorted(source_counts.keys())),
                     )
 
         after_snapshot = _kraken_state_snapshot()
