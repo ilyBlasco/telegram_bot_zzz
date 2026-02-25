@@ -125,6 +125,7 @@ GMAIL_ZELLE_BASK_PARSER_STRICT = (os.getenv("GMAIL_ZELLE_BASK_PARSER_STRICT", "1
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
+TRACKING_MODE_NOTIFY_DELETE_SECONDS = 15
 
 # Hard cap: only 2 participants for the whole bot
 MAX_PARTICIPANTS = 2
@@ -500,6 +501,28 @@ def get_confirmer_id() -> int | None:
             "SELECT user_id FROM participants ORDER BY added_at ASC LIMIT 1"
         ).fetchone()
         return int(row["user_id"]) if row else None
+
+
+def _participant_display_name(first_name: str | None, username: str | None, user_id: int) -> str:
+    first = str(first_name or "").strip()
+    if first:
+        return first
+    uname = str(username or "").strip()
+    if uname:
+        return f"@{uname}"
+    return str(user_id)
+
+
+def get_participant_display_name_map() -> dict[int, str]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id, first_name, username FROM participants"
+        ).fetchall()
+    out: dict[int, str] = {}
+    for row in rows:
+        uid = int(row["user_id"])
+        out[uid] = _participant_display_name(row["first_name"], row["username"], uid)
+    return out
 
 
 # =========================
@@ -3491,13 +3514,16 @@ def build_panel_text(total_cents: int) -> str:
     )
 
 
-def build_panel_keyboard() -> InlineKeyboardMarkup:
+def build_panel_keyboard(viewer_id: int | None = None) -> InlineKeyboardMarkup:
     tracking_mode = get_tracking_mode()
+    confirmer_id = get_confirmer_id()
+    is_admin_viewer = bool(confirmer_id and viewer_id == confirmer_id)
     rows: list[list[InlineKeyboardButton]] = []
-    if tracking_mode == "manual":
-        rows.append([InlineKeyboardButton("Switch to AUTO", callback_data="trackmode:auto")])
-    else:
-        rows.append([InlineKeyboardButton("Switch to MANUAL", callback_data="trackmode:manual")])
+    if is_admin_viewer:
+        if tracking_mode == "manual":
+            rows.append([InlineKeyboardButton("Switch to AUTO", callback_data="trackmode:auto")])
+        else:
+            rows.append([InlineKeyboardButton("Switch to MANUAL", callback_data="trackmode:manual")])
 
     rows.append([InlineKeyboardButton("👥 Senders", callback_data="senders")])
 
@@ -3509,7 +3535,7 @@ def build_panel_keyboard() -> InlineKeyboardMarkup:
         history_row.append(InlineKeyboardButton("⏪ Control + Z", callback_data="undo"))
     rows.append(history_row)
 
-    if tracking_mode == "manual":
+    if is_admin_viewer:
         rows.append([InlineKeyboardButton("🛠 Admin Reverse", callback_data="adminrev")])
 
     rows.append([InlineKeyboardButton("解Release除", callback_data="release")])
@@ -3703,7 +3729,7 @@ async def send_or_update_panel_for_app(chat_id: int, app: Application):
     total_cents = g["total_cents"]
 
     text = build_panel_text(total_cents)
-    kb = build_panel_keyboard()
+    kb = build_panel_keyboard(chat_id)
 
     panel_message_id = st.get("panel_message_id")
     if panel_message_id:
@@ -4003,12 +4029,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_all_panels(context)
 
         if bool(mode_result.get("changed")):
-            await notify(
-                context,
+            await notify_for_app(
+                context.application,
                 (
                     "<b>Tracking mode</b>\n"
                     f"Modo activo: <b>{_html_escape(new_mode.upper())}</b>"
                 ),
+                delete_seconds=TRACKING_MODE_NOTIFY_DELETE_SECONDS,
             )
         return
 
@@ -4084,8 +4111,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "adminrev":
-        if tracking_mode != "manual":
-            return
         confirmer_id = get_confirmer_id()
         if not confirmer_id or user.id != confirmer_id:
             return
@@ -4100,8 +4125,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adminrev:page:"):
-        if tracking_mode != "manual":
-            return
         confirmer_id = get_confirmer_id()
         if not confirmer_id or user.id != confirmer_id:
             return
@@ -4119,8 +4142,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adminrev:select:"):
-        if tracking_mode != "manual":
-            return
         confirmer_id = get_confirmer_id()
         if not confirmer_id or user.id != confirmer_id:
             return
@@ -4146,8 +4167,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adminrev:do:") or data.startswith("adminrev:block_and_do:"):
-        if tracking_mode != "manual":
-            return
         confirmer_id = get_confirmer_id()
         if not confirmer_id or user.id != confirmer_id:
             return
@@ -4368,7 +4387,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db() as conn:
             rows = conn.execute(
                 """
-                SELECT kind, amount_cents, total_after_cents, actor_id, created_at
+                SELECT id, kind, amount_cents, total_after_cents, actor_id, created_at
                 FROM movements
                 WHERE session_id = ?
                 ORDER BY id DESC
@@ -4380,29 +4399,80 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro."
         else:
+            participant_names = get_participant_display_name_map()
+            movement_ids = [int(r["id"]) for r in rows if r["id"] is not None]
+            gmail_payer_by_movement: dict[int, str] = {}
+            reversal_payer_by_movement: dict[int, str] = {}
+            if movement_ids:
+                placeholders = ",".join("?" for _ in movement_ids)
+                with db() as conn:
+                    gmail_rows = conn.execute(
+                        f"""
+                        SELECT movement_id, notes
+                        FROM gmail_processed_messages
+                        WHERE status = 'added'
+                          AND movement_id IN ({placeholders})
+                        """,
+                        tuple(movement_ids),
+                    ).fetchall()
+                    rev_rows = conn.execute(
+                        f"""
+                        SELECT reversal_movement_id, payer_display
+                        FROM gmail_reversals
+                        WHERE reversal_movement_id IN ({placeholders})
+                        """,
+                        tuple(movement_ids),
+                    ).fetchall()
+
+                for gr in gmail_rows:
+                    if gr["movement_id"] is None:
+                        continue
+                    meta = _json_loads_object_or_none(gr["notes"])
+                    if not meta:
+                        continue
+                    payer = str(meta.get("payer_display") or meta.get("identity_display") or "").strip()
+                    if payer:
+                        gmail_payer_by_movement[int(gr["movement_id"])] = payer
+
+                for rr in rev_rows:
+                    if rr["reversal_movement_id"] is None:
+                        continue
+                    payer = str(rr["payer_display"] or "").strip()
+                    if payer:
+                        reversal_payer_by_movement[int(rr["reversal_movement_id"])] = payer
+
             months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
             lines = ["<b>📜 History (sesión actual)</b>", ""]
             for r in rows:
                 dt_utc = datetime.fromisoformat(r["created_at"])
                 ts = f"{dt_utc.day:02d} {months[dt_utc.month - 1]} {dt_utc.year}"
 
+                movement_id = int(r["id"])
                 kind = str(r["kind"] or "")
                 amt_cents = int(r["amount_cents"] or 0)
                 total_after_cents = int(r["total_after_cents"] or 0)
+                actor_id = int(r["actor_id"]) if r["actor_id"] is not None else None
+                actor_name = participant_names.get(actor_id or -1)
+                display_name = None
                 if kind == "add":
                     label = "Add"
                     amount_disp = f"${cents_to_money_str(amt_cents)}"
+                    display_name = gmail_payer_by_movement.get(movement_id) or actor_name
                 elif kind == "release":
                     label = "Release"
                     amount_disp = f"${cents_to_money_str(amt_cents)}"
+                    display_name = actor_name
                 elif kind == "reversal":
                     label = "Reversal"
                     amount_disp = f"-${cents_to_money_str(amt_cents)}"
+                    display_name = reversal_payer_by_movement.get(movement_id) or actor_name
                 else:
                     label = kind
                     amount_disp = f"${cents_to_money_str(amt_cents)}"
+                    display_name = actor_name
+                name_suffix = f" &#183; {_html_escape(display_name)}" if display_name else ""
                 lines.append(
-                    f"&#183; <b>{label}</b>: <code>{amount_disp}</code> "
+                    f"&#183; <b>{_html_escape(label)}{name_suffix}</b>: <code>{amount_disp}</code> "
                     f"&#8594; Total: <code>${cents_to_money_str(total_after_cents)}</code>\n"
                     f"  <i>{ts}</i>"
                 )
@@ -4418,7 +4488,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_chat.id,
             context,
             text=build_panel_text(total_cents),
-            reply_markup=build_panel_keyboard(),
+            reply_markup=build_panel_keyboard(update.effective_chat.id),
         )
         return
 
