@@ -10,6 +10,7 @@ import hashlib
 import contextlib
 import re
 import html as html_lib
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from email.utils import parseaddr
@@ -105,6 +106,22 @@ GMAIL_ZELLE_QUERY_EXTRA = (os.getenv("GMAIL_ZELLE_QUERY_EXTRA", "").strip() or "
 GMAIL_ZELLE_SUBJECT_REGEX = (os.getenv("GMAIL_ZELLE_SUBJECT_REGEX", "").strip() or "")
 GMAIL_ZELLE_AMOUNT_REGEX = (os.getenv("GMAIL_ZELLE_AMOUNT_REGEX", "").strip() or "")
 GMAIL_ZELLE_SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
+GMAIL_ZELLE_NOTIFY_DELETE_SECONDS = max(60, int(os.getenv("GMAIL_ZELLE_NOTIFY_DELETE_SECONDS", "172800")))
+TRACKING_MODE_DEFAULT = (os.getenv("TRACKING_MODE_DEFAULT", "auto").strip().lower() or "auto")
+if TRACKING_MODE_DEFAULT not in {"auto", "manual"}:
+    TRACKING_MODE_DEFAULT = "auto"
+GMAIL_ZELLE_BASK_ONLY = (os.getenv("GMAIL_ZELLE_BASK_ONLY", "1").strip() != "0")
+GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS = (
+    os.getenv("GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS", "customersupport@baskbank.com").strip()
+    or "customersupport@baskbank.com"
+)
+GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS_SET = {
+    str(x).strip().lower()
+    for x in GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS.replace(";", ",").split(",")
+    if str(x).strip()
+}
+GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS = (os.getenv("GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS", "").strip() or "")
+GMAIL_ZELLE_BASK_PARSER_STRICT = (os.getenv("GMAIL_ZELLE_BASK_PARSER_STRICT", "1").strip() != "0")
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
@@ -137,6 +154,7 @@ _GMAIL_ZELLE_IMPORT_ERROR_WARNED = False
 GMAIL_ZELLE_STATUS: dict = {
     "enabled": GMAIL_ZELLE_ENABLED,
     "mode": GMAIL_ZELLE_MODE,
+    "tracking_mode": TRACKING_MODE_DEFAULT,
     "last_poll_started_at": None,
     "last_poll_success_at": None,
     "last_poll_error_at": None,
@@ -168,6 +186,7 @@ KRAKEN_CACHE: dict = {
 }
 
 GMAIL_SENDER_LIST_PAGE_SIZE = 10
+ADMIN_REVERSE_PAGE_SIZE = 5
 
 
 # =========================
@@ -302,6 +321,34 @@ def init_db():
                 last_matched_amount_cents INTEGER,
                 last_matched_message_id TEXT,
                 display_name_hint TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by INTEGER
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gmail_reversals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gmail_message_id TEXT NOT NULL,
+                original_movement_id INTEGER NOT NULL,
+                reversal_movement_id INTEGER NOT NULL,
+                payer_key TEXT,
+                payer_display TEXT,
+                amount_cents INTEGER NOT NULL,
+                reason TEXT,
+                reversed_by INTEGER NOT NULL,
+                reversed_at TEXT NOT NULL
             )
             """
         )
@@ -606,6 +653,134 @@ def _normalize_sender_email(email_text: str | None) -> str:
     return str(email_text or "").strip().lower()
 
 
+def _normalize_identity_key(value: str | None) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_payer_key(value: str | None) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.lower()
+
+
+def _json_dumps_compact(data: dict | None) -> str | None:
+    if not data:
+        return None
+    try:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return None
+
+
+def _json_loads_object_or_none(text: str | None) -> dict | None:
+    raw = str(text or "").strip()
+    if not raw or not raw.startswith("{"):
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def get_app_setting(key: str) -> str | None:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (str(key),)).fetchone()
+        if not row:
+            return None
+        return str(row["value"])
+
+
+def _normalize_tracking_mode(value: str | None) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in {"auto", "manual"}:
+        return TRACKING_MODE_DEFAULT
+    return mode
+
+
+def get_tracking_mode() -> str:
+    raw = get_app_setting("tracking_mode")
+    if raw is None:
+        return TRACKING_MODE_DEFAULT
+    return _normalize_tracking_mode(raw)
+
+
+def set_tracking_mode_tx(mode: str, updated_by: int | None) -> dict:
+    normalized = _normalize_tracking_mode(mode)
+    now_iso = now_utc_iso()
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'tracking_mode'").fetchone()
+        previous = _normalize_tracking_mode(str(row["value"])) if row and row["value"] is not None else TRACKING_MODE_DEFAULT
+        conn.execute(
+            """
+            INSERT INTO app_settings(key, value, updated_at, updated_by)
+            VALUES('tracking_mode', ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+            """,
+            (normalized, now_iso, updated_by),
+        )
+    return {"mode": normalized, "previous_mode": previous, "changed": normalized != previous}
+
+
+def _gmail_bask_metadata_from_parsed(parsed: dict) -> dict:
+    return {
+        "source_kind": "bask_zelle",
+        "confirmation_number": str(parsed.get("confirmation_number") or ""),
+        "payer_key": str(parsed.get("payer_key") or ""),
+        "payer_display": str(parsed.get("payer_display") or ""),
+        "bank_sender_email": str(parsed.get("bank_sender_email") or ""),
+        "to_line": str(parsed.get("to_line") or ""),
+        "parser": "bask_strict_v1",
+    }
+
+
+def _gmail_event_dt_from_parsed(parsed: dict) -> datetime:
+    event_iso = _parse_iso_utc_or_none(str(parsed.get("event_time_iso") or ""))
+    if event_iso:
+        return event_iso
+    internal_date_ms = parsed.get("internal_date_ms")
+    try:
+        if internal_date_ms is not None:
+            return datetime.fromtimestamp(int(internal_date_ms) / 1000, tz=timezone.utc)
+    except Exception:
+        pass
+    return now_utc()
+
+
+def _format_gmail_event_time_display(parsed: dict) -> str:
+    return _format_kraken_display_time_short(_gmail_event_dt_from_parsed(parsed))
+
+
+def _find_gmail_processed_by_bask_confirmation_in_conn(
+    conn: sqlite3.Connection, confirmation_number: str, amount_cents: int
+) -> sqlite3.Row | None:
+    conf = str(confirmation_number or "").strip()
+    if not conf or amount_cents <= 0:
+        return None
+    rows = conn.execute(
+        """
+        SELECT gmail_message_id, parsed_amount_cents, notes
+        FROM gmail_processed_messages
+        WHERE parsed_amount_cents = ?
+          AND notes IS NOT NULL
+        """,
+        (amount_cents,),
+    ).fetchall()
+    for row in rows:
+        meta = _json_loads_object_or_none(row["notes"])
+        if not meta:
+            continue
+        if str(meta.get("source_kind") or "") != "bask_zelle":
+            continue
+        if str(meta.get("confirmation_number") or "").strip() != conf:
+            continue
+        return row
+    return None
+
+
 def _insert_gmail_processed_message_in_conn(
     conn: sqlite3.Connection,
     *,
@@ -737,6 +912,7 @@ def _gmail_zelle_status_snapshot() -> dict:
     return {
         "enabled": bool(GMAIL_ZELLE_STATUS.get("enabled")),
         "mode": str(GMAIL_ZELLE_STATUS.get("mode") or GMAIL_ZELLE_MODE),
+        "tracking_mode": str(GMAIL_ZELLE_STATUS.get("tracking_mode") or get_tracking_mode()),
         "last_poll_started_at": GMAIL_ZELLE_STATUS.get("last_poll_started_at"),
         "last_poll_success_at": GMAIL_ZELLE_STATUS.get("last_poll_success_at"),
         "last_poll_error_at": GMAIL_ZELLE_STATUS.get("last_poll_error_at"),
@@ -779,36 +955,19 @@ def get_gmail_sender_trust_counts() -> dict[str, int]:
 def _format_gmail_footer_status_block() -> str:
     snap = _gmail_zelle_status_snapshot()
     counts = get_gmail_sender_trust_counts()
-    now_dt = now_utc()
+    tracking_mode = _normalize_tracking_mode(str(snap.get("tracking_mode") or TRACKING_MODE_DEFAULT))
+    tracking_label = _html_escape(tracking_mode.upper())
 
-    if not snap["enabled"]:
+    if not snap["enabled"] or not GMAIL_ZELLE_ENABLED:
         line1 = "<i>Gmail Zelle</i>: <b>OFF</b>"
     else:
-        mode = _html_escape(str(snap.get("mode") or GMAIL_ZELLE_MODE))
         cycle_status = str(snap.get("last_cycle_status") or "idle")
-        success_at = snap.get("last_poll_success_at")
-        error_at = snap.get("last_poll_error_at")
-        started_at = snap.get("last_poll_started_at")
-
-        if cycle_status == "error":
-            err_age = _format_elapsed_ago_short(error_at, now_dt)
-            poll_display = f"ERR {err_age}" if err_age != "never" else "ERR"
-        elif isinstance(success_at, datetime):
-            poll_display = _format_elapsed_ago_short(success_at, now_dt)
-        elif isinstance(started_at, datetime):
-            poll_display = "starting"
-        else:
-            poll_display = "never"
-
-        line1 = (
-            f"<i>Gmail Zelle</i>: <b>ON</b> (<code>{mode}</code>) "
-            f"&#183; Poll: <code>{_html_escape(poll_display)}</code>"
-        )
+        state_label = "ERR" if cycle_status == "error" else "ON"
+        line1 = f"<i>Gmail Zelle</i>: <b>{state_label}</b> (<code>{tracking_label}</code>)"
 
     line2 = (
         f"<i>Senders</i>: ✅ {counts['approved']} "
-        f"&#183; 🟡 {counts['quarantine']} "
-        f"&#183; ⛔ {counts['blocked']}"
+        f"&#183; 🟡 {counts['quarantine']}"
     )
     return f"{line1}\n{line2}"
 
@@ -821,14 +980,14 @@ def _format_sender_list_last_seen(last_seen_dt: datetime | None) -> str:
     if last_seen_dt is None:
         return "--"
     local_dt = last_seen_dt.astimezone(_get_kraken_display_tzinfo())
-    return f"{local_dt.strftime('%b')} {local_dt.day}"
+    hour_12 = local_dt.strftime("%I").lstrip("0") or "12"
+    return f"{local_dt.strftime('%b')} {local_dt.day} {hour_12}:{local_dt.strftime('%M')} {local_dt.strftime('%p')}"
 
 
 def _sender_state_badge(state: str) -> str:
     return {
         "approved": "✅",
         "quarantine": "🟡",
-        "blocked": "⛔",
     }.get(state, "•")
 
 
@@ -848,7 +1007,7 @@ def list_ranked_gmail_senders(page: int, page_size: int = GMAIL_SENDER_LIST_PAGE
     with db() as conn:
         trust_rows = conn.execute(
             """
-            SELECT id, sender_email, state, first_seen_at, last_seen_at, seen_count, last_matched_amount_cents
+            SELECT id, sender_email, state, first_seen_at, last_seen_at, seen_count, last_matched_amount_cents, display_name_hint
             FROM gmail_sender_trust
             """
         ).fetchall()
@@ -881,9 +1040,12 @@ def list_ranked_gmail_senders(page: int, page_size: int = GMAIL_SENDER_LIST_PAGE
     for row in trust_rows:
         sender_email = _normalize_sender_email(row["sender_email"])
         state = str(row["state"] or "quarantine")
+        if state == "blocked":
+            continue
         seen_count = int(row["seen_count"] or 0)
         first_seen_dt = _parse_iso_utc_or_none(str(row["first_seen_at"] or ""))
         last_seen_dt = _parse_iso_utc_or_none(str(row["last_seen_at"] or ""))
+        display_name = str(row["display_name_hint"] or "").strip() or sender_email
         avg_amount_cents = avg_by_sender.get(sender_email)
         if avg_amount_cents is None:
             avg_amount_cents = max(0, int(row["last_matched_amount_cents"] or 0))
@@ -897,6 +1059,7 @@ def list_ranked_gmail_senders(page: int, page_size: int = GMAIL_SENDER_LIST_PAGE
             {
                 "sender_trust_id": int(row["id"]),
                 "sender_email": sender_email,
+                "display_name": display_name,
                 "state": state,
                 "seen_count": seen_count,
                 "first_seen_at": first_seen_dt,
@@ -954,7 +1117,7 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
     base_rank = (page * GMAIL_SENDER_LIST_PAGE_SIZE) + 1
     for idx, row in enumerate(rows):
         rank_num = base_rank + idx
-        email_txt = _html_escape(str(row.get("sender_email") or ""))
+        display_txt = _html_escape(str(row.get("display_name") or row.get("sender_email") or ""))
         state = str(row.get("state") or "")
         badge = _sender_state_badge(state)
         seen_count = int(row.get("seen_count") or 0)
@@ -962,12 +1125,318 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
         avg_amount_txt = _format_usd_est_amount_int(Decimal(avg_cents) / Decimal(100))
         last_seen_txt = _format_sender_list_last_seen(row.get("last_seen_at"))
 
-        lines.append(f"{rank_num}. {badge} <code>{email_txt}</code>")
+        lines.append(f"{rank_num}. {badge} <code>{display_txt}</code>")
         lines.append(
             f"   <i>seen</i>: {seen_count} &#183; <i>avg</i>: {avg_amount_txt} &#183; <i>last</i>: {last_seen_txt}"
         )
 
     return "\n".join(lines), has_prev, has_next
+
+
+def _gmail_auto_added_event_from_row(row: sqlite3.Row) -> dict:
+    notes = _json_loads_object_or_none(row["notes"])
+    payer_display = str(
+        (notes or {}).get("payer_display")
+        or (notes or {}).get("identity_display")
+        or row["parsed_sender_name"]
+        or row["sender_email"]
+        or "Desconocido"
+    ).strip()
+    payer_key = str((notes or {}).get("payer_key") or (notes or {}).get("identity_key") or "").strip()
+    confirmation_number = str((notes or {}).get("confirmation_number") or "").strip()
+
+    event_dt = None
+    try:
+        internal_ms = row["internal_date_ms"]
+        if internal_ms is not None:
+            event_dt = datetime.fromtimestamp(int(internal_ms) / 1000, tz=timezone.utc)
+    except Exception:
+        event_dt = None
+    if event_dt is None:
+        event_dt = _parse_iso_utc_or_none(str(row["processed_at"] or "")) or now_utc()
+
+    return {
+        "gmail_message_id": str(row["gmail_message_id"] or ""),
+        "movement_id": int(row["movement_id"]),
+        "amount_cents": int(row["parsed_amount_cents"] or 0),
+        "payer_display": payer_display,
+        "payer_key": payer_key,
+        "confirmation_number": confirmation_number,
+        "event_dt": event_dt,
+        "is_reversed": bool(row["reversal_id"] is not None),
+        "reversed_at": _parse_iso_utc_or_none(str(row["reversed_at"] or "")) if row["reversed_at"] else None,
+    }
+
+
+def list_recent_gmail_auto_added_events(
+    page: int,
+    page_size: int = ADMIN_REVERSE_PAGE_SIZE,
+) -> tuple[list[dict], bool, bool]:
+    page = max(0, int(page))
+    page_size = max(1, int(page_size))
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                g.gmail_message_id,
+                g.movement_id,
+                g.parsed_amount_cents,
+                g.parsed_sender_name,
+                g.sender_email,
+                g.internal_date_ms,
+                g.processed_at,
+                g.notes,
+                r.id AS reversal_id,
+                r.reversed_at AS reversed_at
+            FROM gmail_processed_messages g
+            LEFT JOIN gmail_reversals r
+              ON r.gmail_message_id = g.gmail_message_id
+            WHERE g.status = 'added'
+              AND g.movement_id IS NOT NULL
+            ORDER BY COALESCE(g.internal_date_ms, 0) DESC, g.gmail_message_id DESC
+            """
+        ).fetchall()
+
+    items = [_gmail_auto_added_event_from_row(row) for row in rows]
+    if items:
+        max_page = (len(items) - 1) // page_size
+        page = min(page, max_page)
+    else:
+        page = 0
+    start = page * page_size
+    end = start + page_size
+    page_items = items[start:end]
+    return page_items, page > 0, end < len(items)
+
+
+def get_recent_gmail_auto_added_event_by_message_id(gmail_message_id: str) -> dict | None:
+    msg_id = str(gmail_message_id or "").strip()
+    if not msg_id:
+        return None
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                g.gmail_message_id,
+                g.movement_id,
+                g.parsed_amount_cents,
+                g.parsed_sender_name,
+                g.sender_email,
+                g.internal_date_ms,
+                g.processed_at,
+                g.notes,
+                r.id AS reversal_id,
+                r.reversed_at AS reversed_at
+            FROM gmail_processed_messages g
+            LEFT JOIN gmail_reversals r
+              ON r.gmail_message_id = g.gmail_message_id
+            WHERE g.gmail_message_id = ?
+              AND g.status = 'added'
+              AND g.movement_id IS NOT NULL
+            LIMIT 1
+            """,
+            (msg_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return _gmail_auto_added_event_from_row(row)
+
+
+def build_admin_reverse_list_text(page: int, viewer_id: int) -> tuple[str, list[dict], bool, bool]:
+    _ = viewer_id
+    rows, has_prev, has_next = list_recent_gmail_auto_added_events(page=page, page_size=ADMIN_REVERSE_PAGE_SIZE)
+    if not rows:
+        return (
+            "<b>🛠 Admin Reverse</b>\n\n<i>No hay transacciones auto-detectadas para revertir.</i>",
+            [],
+            has_prev,
+            has_next,
+        )
+
+    lines = [
+        "<b>🛠 Admin Reverse</b>",
+        "<i>Recientes auto-ingest (Gmail/Bask)</i>",
+        "",
+    ]
+    base_rank = (max(0, int(page)) * ADMIN_REVERSE_PAGE_SIZE) + 1
+    for idx, row in enumerate(rows):
+        rank_num = base_rank + idx
+        payer_txt = _html_escape(str(row.get("payer_display") or "Desconocido"))
+        amount_txt = cents_to_money_str(int(row.get("amount_cents") or 0))
+        when_txt = _html_escape(_format_kraken_display_time_short(row["event_dt"]))
+        conf = str(row.get("confirmation_number") or "")
+        reversed_badge = " <i>[reverted]</i>" if row.get("is_reversed") else ""
+        lines.append(f"{rank_num}. <code>{payer_txt}</code>{reversed_badge}")
+        lines.append(f"   <i>${amount_txt} &#183; {when_txt}</i>")
+        if conf:
+            lines.append(f"   <i>Conf:</i> <code>{_html_escape(conf)}</code>")
+    return "\n".join(lines), rows, has_prev, has_next
+
+
+def build_admin_reverse_list_keyboard(page: int, rows: list[dict], has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        if row.get("is_reversed"):
+            continue
+        payer_name = str(row.get("payer_display") or "Desconocido")
+        short_name = payer_name if len(payer_name) <= 18 else (payer_name[:15] + "...")
+        amt = cents_to_money_str(int(row.get("amount_cents") or 0))
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"↩️ ${amt} · {short_name}",
+                    callback_data=f"adminrev:select:{row['gmail_message_id']}",
+                )
+            ]
+        )
+
+    nav: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"adminrev:page:{max(0, page - 1)}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"adminrev:page:{page + 1}"))
+    if nav:
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton("Volver", callback_data="back")])
+    return InlineKeyboardMarkup(kb_rows)
+
+
+def build_admin_reverse_confirm_text(event: dict) -> str:
+    payer_txt = _html_escape(str(event.get("payer_display") or "Desconocido"))
+    amt_txt = cents_to_money_str(int(event.get("amount_cents") or 0))
+    when_txt = _html_escape(_format_kraken_display_time_short(event["event_dt"]))
+    conf = str(event.get("confirmation_number") or "")
+    reversed_line = "\n<i>Ya fue revertido.</i>" if event.get("is_reversed") else ""
+    conf_line = f"\nConf: <code>{_html_escape(conf)}</code>" if conf else ""
+    return (
+        "<b>🛠 Admin Reverse</b>\n\n"
+        f"Payer: <code>{payer_txt}</code>\n"
+        f"Monto: <code>${amt_txt}</code>\n"
+        f"Hora: <i>{when_txt}</i>"
+        f"{conf_line}"
+        f"{reversed_line}"
+    )
+
+
+def build_admin_reverse_confirm_keyboard(gmail_message_id: str, *, is_reversed: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if not is_reversed:
+        rows.append(
+            [
+                InlineKeyboardButton("✅ Reverse", callback_data=f"adminrev:do:{gmail_message_id}"),
+                InlineKeyboardButton("⛔ Reverse + block", callback_data=f"adminrev:block_and_do:{gmail_message_id}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅ Volver", callback_data="adminrev")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_reverse_gmail_event_tx(gmail_message_id: str, acting_user_id: int, *, block_payer: bool = False) -> dict:
+    msg_id = str(gmail_message_id or "").strip()
+    if not msg_id:
+        return {"status": "invalid"}
+
+    now_iso = now_utc_iso()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT g.gmail_message_id, g.movement_id, g.parsed_amount_cents, g.notes
+            FROM gmail_processed_messages g
+            WHERE g.gmail_message_id = ?
+              AND g.status = 'added'
+              AND g.movement_id IS NOT NULL
+            LIMIT 1
+            """,
+            (msg_id,),
+        ).fetchone()
+        if not row:
+            return {"status": "missing"}
+
+        existing_rev = conn.execute(
+            "SELECT id FROM gmail_reversals WHERE gmail_message_id = ? LIMIT 1",
+            (msg_id,),
+        ).fetchone()
+        if existing_rev:
+            return {"status": "already_reversed"}
+
+        original_movement_id = int(row["movement_id"])
+        original_movement = conn.execute(
+            "SELECT id FROM movements WHERE id = ? LIMIT 1",
+            (original_movement_id,),
+        ).fetchone()
+        if not original_movement:
+            return {"status": "missing_original_movement"}
+
+        amount_cents = int(row["parsed_amount_cents"] or 0)
+        if amount_cents <= 0:
+            return {"status": "invalid_amount"}
+
+        meta = _json_loads_object_or_none(row["notes"])
+        payer_key = str((meta or {}).get("payer_key") or (meta or {}).get("identity_key") or "").strip()
+        payer_display = str((meta or {}).get("payer_display") or (meta or {}).get("identity_display") or "").strip()
+
+        g = conn.execute("SELECT total_cents, session_id FROM global_state WHERE id = 1").fetchone()
+        current_total = int(g["total_cents"])
+        current_session = int(g["session_id"])
+        new_total = current_total - amount_cents
+        if new_total < 0:
+            new_total = 0
+
+        conn.execute("UPDATE global_state SET total_cents = ? WHERE id = 1", (new_total,))
+        cur = conn.execute(
+            """
+            INSERT INTO movements(session_id, kind, amount_cents, total_after_cents, actor_id, created_at)
+            VALUES (?, 'reversal', ?, ?, ?, ?)
+            """,
+            (current_session, amount_cents, new_total, acting_user_id, now_iso),
+        )
+        reversal_movement_id = int(cur.lastrowid)
+
+        conn.execute(
+            """
+            INSERT INTO gmail_reversals(
+                gmail_message_id, original_movement_id, reversal_movement_id,
+                payer_key, payer_display, amount_cents, reason, reversed_by, reversed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                msg_id,
+                original_movement_id,
+                reversal_movement_id,
+                payer_key or None,
+                payer_display or None,
+                amount_cents,
+                "admin_reverse",
+                acting_user_id,
+                now_iso,
+            ),
+        )
+
+        blocked_applied = False
+        if block_payer and payer_key:
+            cur2 = conn.execute(
+                """
+                UPDATE gmail_sender_trust
+                SET state = 'blocked',
+                    blocked_at = ?,
+                    blocked_by = ?,
+                    auto_promote_at = NULL
+                WHERE sender_email = ?
+                """,
+                (now_iso, acting_user_id, payer_key),
+            )
+            blocked_applied = cur2.rowcount > 0
+
+        return {
+            "status": "reversed",
+            "gmail_message_id": msg_id,
+            "amount_cents": amount_cents,
+            "payer_key": payer_key,
+            "payer_display": payer_display,
+            "new_total_cents": new_total,
+            "reversal_movement_id": reversal_movement_id,
+            "blocked_applied": blocked_applied,
+        }
 
 
 def process_gmail_zelle_parsed_tx(parsed: dict, actor_id: int | None, mode: str) -> dict:
@@ -978,6 +1447,16 @@ def process_gmail_zelle_parsed_tx(parsed: dict, actor_id: int | None, mode: str)
     now_dt = now_utc()
     now_iso = dt_to_iso(now_dt)
     sender_email = _normalize_sender_email(parsed.get("sender_email"))
+    identity_key = _normalize_identity_key(parsed.get("identity_key")) or sender_email
+    identity_display = str(
+        parsed.get("identity_display")
+        or parsed.get("payer_display")
+        or parsed.get("sender_display_name")
+        or sender_email
+        or ""
+    ).strip()
+    source_kind = str(parsed.get("source_kind") or "")
+    confirmation_number = str(parsed.get("confirmation_number") or "").strip()
     amount_cents = int(parsed.get("amount_cents") or 0)
     gmail_message_id = str(parsed.get("gmail_message_id") or "")
     sender_display_name = str(parsed.get("sender_display_name") or "")
@@ -986,8 +1465,15 @@ def process_gmail_zelle_parsed_tx(parsed: dict, actor_id: int | None, mode: str)
         return {"status": "invalid_parsed", "reason": "missing_message_id"}
     if not sender_email:
         return {"status": "invalid_parsed", "reason": "missing_sender_email"}
+    if not identity_key:
+        return {"status": "invalid_parsed", "reason": "missing_identity_key"}
     if amount_cents <= 0:
         return {"status": "invalid_parsed", "reason": "invalid_amount"}
+
+    meta: dict | None = None
+    if source_kind == "bask_zelle":
+        meta = _gmail_bask_metadata_from_parsed(parsed)
+    base_notes = _json_dumps_compact(meta)
 
     with db() as conn:
         existing = conn.execute(
@@ -1001,12 +1487,32 @@ def process_gmail_zelle_parsed_tx(parsed: dict, actor_id: int | None, mode: str)
                 "movement_id": int(existing["movement_id"]) if existing["movement_id"] is not None else None,
             }
 
+        if source_kind == "bask_zelle" and confirmation_number:
+            dup_conf = _find_gmail_processed_by_bask_confirmation_in_conn(conn, confirmation_number, amount_cents)
+            if dup_conf:
+                dup_meta = dict(meta or {})
+                dup_meta["duplicate_reason"] = "bask_confirmation_number"
+                dup_meta["duplicate_of_gmail_message_id"] = str(dup_conf["gmail_message_id"] or "")
+                _insert_gmail_processed_message_in_conn(
+                    conn,
+                    parsed=parsed,
+                    status="ignored_duplicate",
+                    notes=_json_dumps_compact(dup_meta),
+                )
+                return {
+                    "status": "duplicate",
+                    "duplicate_reason": "bask_confirmation_number",
+                    "duplicate_of_gmail_message_id": str(dup_conf["gmail_message_id"] or ""),
+                }
+
         trust = conn.execute(
             "SELECT * FROM gmail_sender_trust WHERE sender_email = ?",
-            (sender_email,),
+            (identity_key,),
         ).fetchone()
 
+        is_new_sender = False
         if trust is None:
+            is_new_sender = True
             auto_promote_at = dt_to_iso(now_dt + timedelta(days=GMAIL_ZELLE_AUTO_PROMOTE_DAYS))
             cur = conn.execute(
                 """
@@ -1017,108 +1523,101 @@ def process_gmail_zelle_parsed_tx(parsed: dict, actor_id: int | None, mode: str)
                 ) VALUES (?, 'quarantine', ?, ?, 1, ?, NULL, NULL, NULL, NULL, ?, ?, ?)
                 """,
                 (
-                    sender_email,
+                    identity_key,
                     now_iso,
                     now_iso,
                     auto_promote_at,
                     amount_cents,
                     gmail_message_id,
-                    sender_display_name or None,
+                    identity_display or sender_display_name or None,
                 ),
             )
             sender_trust_id = int(cur.lastrowid)
-            _insert_gmail_processed_message_in_conn(
-                conn,
-                parsed=parsed,
-                status="quarantined_unknown_sender",
+            state = "quarantine"
+            seen_count = 1
+            auto_promoted = False
+        else:
+            sender_trust_id = int(trust["id"])
+            state = str(trust["state"] or "quarantine")
+            seen_count = int(trust["seen_count"] or 0) + 1
+
+            conn.execute(
+                """
+                UPDATE gmail_sender_trust
+                SET last_seen_at = ?,
+                    seen_count = ?,
+                    last_matched_amount_cents = ?,
+                    last_matched_message_id = ?,
+                    display_name_hint = COALESCE(?, display_name_hint)
+                WHERE id = ?
+                """,
+                (
+                    now_iso,
+                    seen_count,
+                    amount_cents,
+                    gmail_message_id,
+                    identity_display or sender_display_name or None,
+                    sender_trust_id,
+                ),
             )
-            return {
-                "status": "quarantined_unknown_sender",
-                "sender_trust_id": sender_trust_id,
-                "sender_email": sender_email,
-            }
 
-        sender_trust_id = int(trust["id"])
-        state = str(trust["state"] or "quarantine")
-        seen_count = int(trust["seen_count"] or 0) + 1
-
-        conn.execute(
-            """
-            UPDATE gmail_sender_trust
-            SET last_seen_at = ?,
-                seen_count = ?,
-                last_matched_amount_cents = ?,
-                last_matched_message_id = ?,
-                display_name_hint = COALESCE(?, display_name_hint)
-            WHERE id = ?
-            """,
-            (
-                now_iso,
-                seen_count,
-                amount_cents,
-                gmail_message_id,
-                sender_display_name or None,
-                sender_trust_id,
-            ),
-        )
-
-        auto_promoted = False
-        if state == "quarantine":
-            auto_promote_at_raw = trust["auto_promote_at"]
-            auto_promote_at = _parse_iso_utc_or_none(str(auto_promote_at_raw) if auto_promote_at_raw else None)
-            if auto_promote_at is not None and auto_promote_at <= now_dt:
-                conn.execute(
-                    """
-                    UPDATE gmail_sender_trust
-                    SET state = 'approved',
-                        approved_at = ?,
-                        approved_by = 0,
-                        auto_promote_at = NULL
-                    WHERE id = ?
-                    """,
-                    (now_iso, sender_trust_id),
-                )
-                state = "approved"
-                auto_promoted = True
+            auto_promoted = False
+            if state == "quarantine":
+                auto_promote_at_raw = trust["auto_promote_at"]
+                auto_promote_at = _parse_iso_utc_or_none(str(auto_promote_at_raw) if auto_promote_at_raw else None)
+                if auto_promote_at is not None and auto_promote_at <= now_dt:
+                    conn.execute(
+                        """
+                        UPDATE gmail_sender_trust
+                        SET state = 'approved',
+                            approved_at = ?,
+                            approved_by = 0,
+                            auto_promote_at = NULL
+                        WHERE id = ?
+                        """,
+                        (now_iso, sender_trust_id),
+                    )
+                    state = "approved"
+                    auto_promoted = True
 
         if state == "blocked":
+            blocked_meta = dict(meta or {})
+            blocked_meta["identity_key"] = identity_key
+            blocked_meta["identity_display"] = identity_display
             _insert_gmail_processed_message_in_conn(
                 conn,
                 parsed=parsed,
                 status="blocked_sender",
+                notes=_json_dumps_compact(blocked_meta) or base_notes,
             )
             return {
                 "status": "blocked_sender",
                 "sender_trust_id": sender_trust_id,
-                "sender_email": sender_email,
+                "sender_email": identity_key,
+                "payer_display": identity_display,
             }
 
-        if state == "quarantine":
-            _insert_gmail_processed_message_in_conn(
-                conn,
-                parsed=parsed,
-                status="quarantined_unknown_sender",
-            )
-            return {
-                "status": "quarantined_unknown_sender",
-                "sender_trust_id": sender_trust_id,
-                "sender_email": sender_email,
-                "seen_count": seen_count,
-            }
-
-        # Approved sender path.
+        # AUTO-accept path for valid Bask/gmail matches: quarantine is soft-trust (yellow), not a hard gate.
         if mode != "live" or actor_id is None:
+            shadow_meta = dict(meta or {})
+            shadow_meta["identity_key"] = identity_key
+            shadow_meta["identity_display"] = identity_display
+            shadow_meta["is_new_sender"] = bool(is_new_sender)
+            shadow_meta["auto_promoted"] = bool(auto_promoted)
             _insert_gmail_processed_message_in_conn(
                 conn,
                 parsed=parsed,
                 status="shadow_approved_match",
-                notes="auto_promoted" if auto_promoted else None,
+                notes=_json_dumps_compact(shadow_meta) or base_notes,
             )
             return {
                 "status": "shadow_approved_match",
                 "sender_trust_id": sender_trust_id,
-                "sender_email": sender_email,
+                "sender_email": identity_key,
+                "payer_display": identity_display,
                 "auto_promoted": auto_promoted,
+                "is_new_sender": is_new_sender,
+                "state": state,
             }
 
         row = conn.execute(
@@ -1141,15 +1640,27 @@ def process_gmail_zelle_parsed_tx(parsed: dict, actor_id: int | None, mode: str)
             parsed=parsed,
             status="added",
             movement_id=movement_id,
-            notes="auto_promoted" if auto_promoted else None,
+            notes=_json_dumps_compact(
+                {
+                    **(meta or {}),
+                    "identity_key": identity_key,
+                    "identity_display": identity_display,
+                    "is_new_sender": bool(is_new_sender),
+                    "auto_promoted": bool(auto_promoted),
+                }
+            )
+            or base_notes,
         )
         return {
             "status": "added",
             "movement_id": movement_id,
             "new_total_cents": total_cents,
             "sender_trust_id": sender_trust_id,
-            "sender_email": sender_email,
+            "sender_email": identity_key,
+            "payer_display": identity_display,
             "auto_promoted": auto_promoted,
+            "is_new_sender": is_new_sender,
+            "state": state,
             "actor_id": actor_id,
         }
 
@@ -1358,6 +1869,28 @@ def undo_last_movement_tx() -> dict | None:
                 "kind": "release",
                 "restored_total_cents": last_amount,
                 "restored_session_id": last_session,
+            }
+
+        if last_kind == "reversal":
+            new_total = current_total + last_amount
+            conn.execute("UPDATE global_state SET total_cents = ? WHERE id = 1", (new_total,))
+            rev = conn.execute(
+                """
+                SELECT id, gmail_message_id
+                FROM gmail_reversals
+                WHERE reversal_movement_id = ?
+                LIMIT 1
+                """,
+                (last_id,),
+            ).fetchone()
+            if rev:
+                conn.execute("DELETE FROM gmail_reversals WHERE id = ?", (int(rev["id"]),))
+            conn.execute("DELETE FROM movements WHERE id = ?", (last_id,))
+            return {
+                "kind": "reversal",
+                "undone_amount_cents": last_amount,
+                "new_total_cents": new_total,
+                "gmail_message_id": str(rev["gmail_message_id"] or "") if rev else None,
             }
 
         return {"kind": "unknown"}
@@ -2412,6 +2945,118 @@ def _gmail_extract_message_meta(msg: dict) -> dict:
     }
 
 
+def _gmail_bask_sender_allowed(sender_email: str) -> bool:
+    email_norm = _normalize_sender_email(sender_email)
+    if not email_norm:
+        return False
+    if GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS_SET:
+        return email_norm in GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS_SET
+    return email_norm.endswith("@baskbank.com")
+
+
+def _gmail_bask_section_text(body_text: str) -> str | None:
+    text = str(body_text or "")
+    m = re.search(r"(?is)\bPayment\s+Details\b(.*)", text)
+    if not m:
+        return None
+    section = m.group(1)
+    stop = re.search(
+        r"(?is)\b(Check your account to see when the money will be available|Thank you for using Zelle|Sincerely,)\b",
+        section,
+    )
+    if stop:
+        section = section[: stop.start()]
+    return section.strip() or None
+
+
+def _gmail_bask_parse_fields_from_section(section_text: str) -> dict[str, str]:
+    labels = ["Confirmation Number", "Amount", "From", "To", "Message"]
+    lines = [re.sub(r"\s+", " ", str(line or "")).strip() for line in str(section_text or "").splitlines()]
+    lines = [line for line in lines if line]
+    out: dict[str, str] = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        matched_label = None
+        for label in labels:
+            lab_low = label.lower()
+            line_low = line.lower()
+            if line_low == lab_low or line_low.startswith(lab_low + ":") or line_low.startswith(lab_low + " "):
+                matched_label = label
+                break
+        if matched_label is None:
+            i += 1
+            continue
+
+        remainder = line[len(matched_label):].lstrip(" :\t-").strip()
+        if remainder:
+            out[matched_label] = remainder
+        elif i + 1 < len(lines):
+            out[matched_label] = lines[i + 1].strip()
+            i += 1
+        i += 1
+    return out
+
+
+def _gmail_try_parse_bask_zelle(parsed: dict, body_text: str) -> tuple[dict, str]:
+    sender_email = _normalize_sender_email(parsed.get("sender_email"))
+    subject = str(parsed.get("subject") or "")
+    body_text = str(body_text or "")
+
+    # Strict Bask source gating.
+    if not _gmail_bask_sender_allowed(sender_email):
+        return parsed, "unmatched"
+
+    subject_lower = subject.lower()
+    body_lower = body_text.lower()
+    if "payment details" not in body_lower:
+        return parsed, "unmatched"
+    if "zelle" not in body_lower and "zelle" not in subject_lower:
+        return parsed, "unmatched"
+    if "deposited" not in body_lower and "deposited" not in subject_lower:
+        return parsed, "unmatched"
+
+    section = _gmail_bask_section_text(body_text)
+    if not section:
+        return parsed, "unmatched"
+    fields = _gmail_bask_parse_fields_from_section(section)
+
+    conf_num = str(fields.get("Confirmation Number") or "").strip()
+    amount_raw = str(fields.get("Amount") or "").strip()
+    payer_display = re.sub(r"\s+", " ", str(fields.get("From") or "")).strip()
+    to_line = re.sub(r"\s+", " ", str(fields.get("To") or "")).strip()
+
+    if GMAIL_ZELLE_BASK_PARSER_STRICT:
+        if not conf_num or not amount_raw or not payer_display or not to_line:
+            return parsed, "unmatched"
+        if not re.fullmatch(r"[A-Za-z0-9\-]+", conf_num):
+            return parsed, "unmatched"
+        if GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS and GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS.lower() not in to_line.lower():
+            return parsed, "unmatched"
+
+    amount_norm = amount_raw.replace("$", "").replace(",", "").strip()
+    try:
+        amount_cents = money_to_cents(amount_norm)
+    except Exception:
+        return parsed, "unmatched"
+    if amount_cents <= 0:
+        return parsed, "unmatched"
+
+    parsed["amount_cents"] = amount_cents
+    parsed["confirmation_number"] = conf_num
+    parsed["payer_display"] = payer_display
+    parsed["payer_key"] = _normalize_payer_key(payer_display)
+    parsed["identity_key"] = parsed["payer_key"]
+    parsed["identity_display"] = payer_display
+    parsed["to_line"] = to_line
+    parsed["bank_sender_email"] = sender_email
+    parsed["source_kind"] = "bask_zelle"
+    # Preserve the original bank sender in metadata, but make sender_display_name useful for UI/ranking fallbacks.
+    parsed["bank_sender_display_name"] = str(parsed.get("sender_display_name") or "")
+    parsed["sender_display_name"] = payer_display
+    return parsed, "ok"
+
+
 def parse_zelle_email_from_gmail_message(msg: dict) -> tuple[dict, str]:
     if not isinstance(msg, dict):
         raise RuntimeError("Gmail message has invalid shape")
@@ -2421,6 +3066,9 @@ def parse_zelle_email_from_gmail_message(msg: dict) -> tuple[dict, str]:
 
     parsed = _gmail_extract_message_meta(msg)
     body_text = _gmail_extract_message_text(payload, snippet=msg.get("snippet"))
+
+    if GMAIL_ZELLE_BASK_ONLY:
+        return _gmail_try_parse_bask_zelle(parsed, body_text)
 
     if not _gmail_match_zelle_like_text(parsed.get("subject") or "", body_text):
         return parsed, "unmatched"
@@ -2595,17 +3243,22 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
         GMAIL_ZELLE_STATUS.update(
             {
                 "enabled": False,
+                "tracking_mode": get_tracking_mode(),
                 "last_cycle_status": "disabled",
             }
         )
         return
 
     actor_id = _gmail_actor_id_ready()
+    tracking_mode = get_tracking_mode()
     effective_mode = GMAIL_ZELLE_MODE if actor_id is not None else "shadow"
+    if tracking_mode == "manual":
+        effective_mode = "shadow"
     GMAIL_ZELLE_STATUS.update(
         {
             "enabled": True,
             "mode": effective_mode,
+            "tracking_mode": tracking_mode,
             "last_poll_started_at": now_utc(),
         }
     )
@@ -2617,6 +3270,7 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
             {
                 "enabled": True,
                 "mode": effective_mode,
+                "tracking_mode": tracking_mode,
                 "last_cycle_status": "error",
                 "last_poll_error_at": now_utc(),
                 "last_poll_error_text": str(e)[:200],
@@ -2668,41 +3322,48 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
 
         if status == "quarantined_unknown_sender":
             counts["quarantined"] += 1
-            should_alert = GMAIL_ZELLE_NOTIFY_UNKNOWN_EVERY_MATCH or int(result.get("seen_count") or 1) <= 1
-            if should_alert and result.get("sender_trust_id") is not None:
-                await send_gmail_unknown_sender_alert_for_app(app, parsed, int(result["sender_trust_id"]))
+            panel_changed = True
+            await notify_for_app(
+                app,
+                build_gmail_zelle_detected_notification_text(
+                    parsed,
+                    is_new_sender=True,
+                    mode=effective_mode,
+                ),
+                delete_seconds=GMAIL_ZELLE_NOTIFY_DELETE_SECONDS,
+            )
             continue
 
         if status == "blocked_sender":
             counts["blocked"] += 1
+            panel_changed = True
             continue
 
         if status == "shadow_approved_match":
             counts["shadow"] += 1
-            prefix = "AUTO-PROMOTED " if result.get("auto_promoted") else ""
+            panel_changed = True
             await notify_for_app(
                 app,
-                (
-                    "<b>Gmail Zelle (shadow)</b>\n"
-                    f"{prefix}sender: <code>{_html_escape(parsed.get('sender_email'))}</code>\n"
-                    f"Monto detectado: <code>${cents_to_money_str(int(parsed.get('amount_cents') or 0))}</code>\n"
-                    "<i>No se agregó al total (modo shadow).</i>"
+                build_gmail_zelle_detected_notification_text(
+                    parsed,
+                    is_new_sender=bool(result.get("is_new_sender")),
+                    mode=effective_mode,
                 ),
+                delete_seconds=GMAIL_ZELLE_NOTIFY_DELETE_SECONDS,
             )
             continue
 
         if status == "added":
             counts["added"] += 1
             panel_changed = True
-            auto_promoted_note = " (auto-trust)" if result.get("auto_promoted") else ""
             await notify_for_app(
                 app,
-                (
-                    "<b>Yozu Tracker • Gmail Zelle Auto</b>\n"
-                    f"Sender: <code>{_html_escape(parsed.get('sender_email'))}</code>{auto_promoted_note}\n"
-                    f"Se agregó: <code>${cents_to_money_str(int(parsed.get('amount_cents') or 0))}</code>\n"
-                    f"Total: <code>${cents_to_money_str(int(result.get('new_total_cents') or 0))}</code>"
+                build_gmail_zelle_detected_notification_text(
+                    parsed,
+                    is_new_sender=bool(result.get("is_new_sender")),
+                    mode=effective_mode,
                 ),
+                delete_seconds=GMAIL_ZELLE_NOTIFY_DELETE_SECONDS,
             )
             continue
 
@@ -2724,7 +3385,7 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
         or counts["parse_error"]
     ):
         logger.info(
-            "Gmail Zelle poll summary: listed=%s fetched=%s added=%s quarantined=%s blocked=%s shadow=%s unmatched=%s parse_error=%s duplicate=%s mode=%s",
+            "Gmail Zelle poll summary: listed=%s fetched=%s added=%s quarantined=%s blocked=%s shadow=%s unmatched=%s parse_error=%s duplicate=%s mode=%s tracking_mode=%s",
             counts["listed"],
             counts["fetched"],
             counts["added"],
@@ -2735,12 +3396,14 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
             counts["parse_error"],
             counts["duplicate"],
             effective_mode,
+            tracking_mode,
         )
 
     GMAIL_ZELLE_STATUS.update(
         {
             "enabled": True,
             "mode": effective_mode,
+            "tracking_mode": tracking_mode,
             "last_cycle_status": "ok",
             "last_poll_success_at": now_utc(),
             "last_poll_error_text": None,
@@ -2749,10 +3412,12 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
 
 
 async def gmail_zelle_poll_loop(app: Application) -> None:
+    tracking_mode = get_tracking_mode()
     GMAIL_ZELLE_STATUS.update(
         {
             "enabled": GMAIL_ZELLE_ENABLED,
             "mode": GMAIL_ZELLE_MODE,
+            "tracking_mode": tracking_mode,
             "last_cycle_status": "idle" if GMAIL_ZELLE_ENABLED else "disabled",
         }
     )
@@ -2773,6 +3438,7 @@ async def gmail_zelle_poll_loop(app: Application) -> None:
                     {
                         "enabled": GMAIL_ZELLE_ENABLED,
                         "mode": str(GMAIL_ZELLE_STATUS.get("mode") or GMAIL_ZELLE_MODE),
+                        "tracking_mode": str(GMAIL_ZELLE_STATUS.get("tracking_mode") or get_tracking_mode()),
                         "last_cycle_status": "error",
                         "last_poll_error_at": now_utc(),
                         "last_poll_error_text": str(e)[:200],
@@ -2826,23 +3492,28 @@ def build_panel_text(total_cents: int) -> str:
 
 
 def build_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("👥 Senders", callback_data="senders"),
-            ],
-            [
-                InlineKeyboardButton("✍ Custom", callback_data="custom"),
-            ],
-            [
-                InlineKeyboardButton("📜 History", callback_data="history"),
-                InlineKeyboardButton("⏪ Control + Z", callback_data="undo"),
-            ],
-            [
-                InlineKeyboardButton("解Release除", callback_data="release"),
-            ],
-        ]
-    )
+    tracking_mode = get_tracking_mode()
+    rows: list[list[InlineKeyboardButton]] = []
+    if tracking_mode == "manual":
+        rows.append([InlineKeyboardButton("Switch to AUTO", callback_data="trackmode:auto")])
+    else:
+        rows.append([InlineKeyboardButton("Switch to MANUAL", callback_data="trackmode:manual")])
+
+    rows.append([InlineKeyboardButton("👥 Senders", callback_data="senders")])
+
+    if tracking_mode == "manual":
+        rows.append([InlineKeyboardButton("✍ Custom", callback_data="custom")])
+
+    history_row = [InlineKeyboardButton("📜 History", callback_data="history")]
+    if tracking_mode == "manual":
+        history_row.append(InlineKeyboardButton("⏪ Control + Z", callback_data="undo"))
+    rows.append(history_row)
+
+    if tracking_mode == "manual":
+        rows.append([InlineKeyboardButton("🛠 Admin Reverse", callback_data="adminrev")])
+
+    rows.append([InlineKeyboardButton("解Release除", callback_data="release")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_back_keyboard() -> InlineKeyboardMarkup:
@@ -2918,11 +3589,32 @@ async def delete_later_for_app(app: Application, chat_id: int, message_id: int, 
         )
 
 
-async def notify_for_app(app: Application, text: str):
+def build_gmail_zelle_detected_notification_text(parsed: dict, *, is_new_sender: bool, mode: str) -> str:
+    payer_name = str(
+        parsed.get("identity_display")
+        or parsed.get("payer_display")
+        or parsed.get("sender_display_name")
+        or parsed.get("sender_email")
+        or "Desconocido"
+    ).strip()
+    amount_cents = int(parsed.get("amount_cents") or 0)
+    amount_label = "Monto detectado" if is_new_sender else "Monto"
+    title_base = "Gmail Zelle: remitente nuevo" if is_new_sender else "Gmail Zelle detectado"
+    title = f"{title_base} (shadow)" if mode != "live" else title_base
+    return (
+        f"<b>{_html_escape(title)}</b>\n"
+        f"Nombre: <code>{_html_escape(payer_name)}</code>\n"
+        f"{amount_label}: <code>${cents_to_money_str(amount_cents)}</code>\n"
+        f"Hora: <i>{_html_escape(_format_gmail_event_time_display(parsed))}</i>"
+    )
+
+
+async def notify_for_app(app: Application, text: str, *, delete_seconds: int | None = None):
+    ttl = NOTIFY_DELETE_SECONDS if delete_seconds is None else max(1, int(delete_seconds))
     for uid in get_participants():
         try:
             msg = await app.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
-            app.create_task(delete_later_for_app(app, uid, msg.message_id, NOTIFY_DELETE_SECONDS))
+            app.create_task(delete_later_for_app(app, uid, msg.message_id, ttl))
         except Exception:
             logger.warning("notify_for_app failed for participant user_id=%s", uid, exc_info=True)
 
@@ -3229,6 +3921,19 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_all_panels(context)
         return
 
+    if result["kind"] == "reversal":
+        await notify(
+            context,
+            (
+                "<b>Yozu Tracker</b>\n"
+                "<b>⏪ Control + Z</b>\n"
+                "Se deshizo una <b>reversa</b>.\n"
+                f"Total: <code>${cents_to_money_str(int(result['new_total_cents']))}</code>"
+            ),
+        )
+        await update_all_panels(context)
+        return
+
     await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
 
 
@@ -3276,8 +3981,40 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_expired_confirmations(context)
 
     data = query.data or ""
+    tracking_mode = get_tracking_mode()
+
+    if data.startswith("trackmode:"):
+        confirmer_id = get_confirmer_id()
+        if not confirmer_id or user.id != confirmer_id:
+            return
+        try:
+            target_mode = _normalize_tracking_mode(data.split(":", 1)[1])
+        except Exception:
+            return
+
+        async with STATE_LOCK:
+            mode_result = set_tracking_mode_tx(target_mode, user.id)
+
+        new_mode = str(mode_result.get("mode") or target_mode)
+        GMAIL_ZELLE_STATUS["tracking_mode"] = new_mode
+        if new_mode == "auto":
+            AWAITING_CUSTOM_AMOUNT.clear()
+
+        await update_all_panels(context)
+
+        if bool(mode_result.get("changed")):
+            await notify(
+                context,
+                (
+                    "<b>Tracking mode</b>\n"
+                    f"Modo activo: <b>{_html_escape(new_mode.upper())}</b>"
+                ),
+            )
+        return
 
     if data.startswith("add:"):
+        if tracking_mode != "manual":
+            return
         add_amount = data.split(":", 1)[1]
         add_cents = money_to_cents(add_amount)
 
@@ -3304,6 +4041,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "custom":
+        if tracking_mode != "manual":
+            AWAITING_CUSTOM_AMOUNT.discard(user.id)
+            return
         AWAITING_CUSTOM_AMOUNT.add(user.id)
 
         await edit_panel(
@@ -3343,7 +4083,132 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "adminrev":
+        if tracking_mode != "manual":
+            return
+        confirmer_id = get_confirmer_id()
+        if not confirmer_id or user.id != confirmer_id:
+            return
+        page = 0
+        list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+        await edit_panel(
+            update.effective_chat.id,
+            context,
+            text=list_text,
+            reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+        )
+        return
+
+    if data.startswith("adminrev:page:"):
+        if tracking_mode != "manual":
+            return
+        confirmer_id = get_confirmer_id()
+        if not confirmer_id or user.id != confirmer_id:
+            return
+        try:
+            page = max(0, int(data.split(":", 2)[2]))
+        except Exception:
+            page = 0
+        list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+        await edit_panel(
+            update.effective_chat.id,
+            context,
+            text=list_text,
+            reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+        )
+        return
+
+    if data.startswith("adminrev:select:"):
+        if tracking_mode != "manual":
+            return
+        confirmer_id = get_confirmer_id()
+        if not confirmer_id or user.id != confirmer_id:
+            return
+        gmail_message_id = data.split(":", 2)[2].strip()
+        event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
+        if not event:
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text="<b>🛠 Admin Reverse</b>\n\n<i>La transacción ya no está disponible.</i>",
+                reply_markup=build_back_keyboard(),
+            )
+            return
+        await edit_panel(
+            update.effective_chat.id,
+            context,
+            text=build_admin_reverse_confirm_text(event),
+            reply_markup=build_admin_reverse_confirm_keyboard(
+                gmail_message_id,
+                is_reversed=bool(event.get("is_reversed")),
+            ),
+        )
+        return
+
+    if data.startswith("adminrev:do:") or data.startswith("adminrev:block_and_do:"):
+        if tracking_mode != "manual":
+            return
+        confirmer_id = get_confirmer_id()
+        if not confirmer_id or user.id != confirmer_id:
+            return
+        try:
+            _, action, gmail_message_id = data.split(":", 2)
+        except Exception:
+            return
+        block_payer = action == "block_and_do"
+
+        async with STATE_LOCK:
+            reverse_result = admin_reverse_gmail_event_tx(gmail_message_id, user.id, block_payer=block_payer)
+
+        status = str(reverse_result.get("status") or "")
+        if status == "reversed":
+            payer_display = _html_escape(reverse_result.get("payer_display") or "Desconocido")
+            amount_cents = int(reverse_result.get("amount_cents") or 0)
+            blocked_applied = bool(reverse_result.get("blocked_applied"))
+            extra = "\n<i>Payer bloqueado.</i>" if blocked_applied else ""
+            await notify(
+                context,
+                (
+                    "<b>🛠 Admin Reverse</b>\n"
+                    f"Payer: <code>{payer_display}</code>\n"
+                    f"Reversa aplicada: <code>${cents_to_money_str(amount_cents)}</code>\n"
+                    f"Total: <code>${cents_to_money_str(int(reverse_result.get('new_total_cents') or 0))}</code>"
+                    f"{extra}"
+                ),
+            )
+            await update_all_panels(context)
+        elif status == "already_reversed":
+            await notify(context, "<b>🛠 Admin Reverse</b>\nEsa transacción ya fue revertida.")
+        elif status == "missing":
+            await notify(context, "<b>🛠 Admin Reverse</b>\nNo encontré esa transacción.")
+        else:
+            await notify(context, "<b>🛠 Admin Reverse</b>\nNo se pudo aplicar la reversa.")
+
+        event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
+        if event:
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=build_admin_reverse_confirm_text(event),
+                reply_markup=build_admin_reverse_confirm_keyboard(
+                    gmail_message_id,
+                    is_reversed=bool(event.get("is_reversed")),
+                ),
+            )
+        else:
+            page = 0
+            list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=list_text,
+                reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+            )
+        return
+
     if data == "undo":
+        if tracking_mode != "manual":
+            return
         await undo_last(update, context)
         return
 
@@ -3521,11 +4386,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 dt_utc = datetime.fromisoformat(r["created_at"])
                 ts = f"{dt_utc.day:02d} {months[dt_utc.month - 1]} {dt_utc.year}"
 
-                kind = r["kind"]
-                label = "Add" if kind == "add" else ("Release" if kind == "release" else kind)
+                kind = str(r["kind"] or "")
+                amt_cents = int(r["amount_cents"] or 0)
+                total_after_cents = int(r["total_after_cents"] or 0)
+                if kind == "add":
+                    label = "Add"
+                    amount_disp = f"${cents_to_money_str(amt_cents)}"
+                elif kind == "release":
+                    label = "Release"
+                    amount_disp = f"${cents_to_money_str(amt_cents)}"
+                elif kind == "reversal":
+                    label = "Reversal"
+                    amount_disp = f"-${cents_to_money_str(amt_cents)}"
+                else:
+                    label = kind
+                    amount_disp = f"${cents_to_money_str(amt_cents)}"
                 lines.append(
-                    f"• <b>{label}</b>: <code>${cents_to_money_str(r['amount_cents'])}</code> "
-                    f"→ Total: <code>${cents_to_money_str(r['total_after_cents'])}</code>\n"
+                    f"&#183; <b>{label}</b>: <code>{amount_disp}</code> "
+                    f"&#8594; Total: <code>${cents_to_money_str(total_after_cents)}</code>\n"
                     f"  <i>{ts}</i>"
                 )
             hist_text = "\n".join(lines)
@@ -3557,6 +4435,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cleanup_expired_confirmations(context)
 
     if user.id not in AWAITING_CUSTOM_AMOUNT:
+        return
+
+    if get_tracking_mode() != "manual":
+        AWAITING_CUSTOM_AMOUNT.discard(user.id)
         return
 
     chat_id = update.effective_chat.id
