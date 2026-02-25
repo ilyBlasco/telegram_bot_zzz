@@ -980,7 +980,7 @@ def _format_gmail_footer_status_block() -> str:
     snap = _gmail_zelle_status_snapshot()
     counts = get_gmail_sender_trust_counts()
     tracking_mode = _normalize_tracking_mode(str(snap.get("tracking_mode") or TRACKING_MODE_DEFAULT))
-    mode_suffix = " (MANUAL)" if tracking_mode == "manual" else ""
+    mode_suffix = f" ({tracking_mode.upper()})"
 
     if not snap["enabled"] or not GMAIL_ZELLE_ENABLED:
         line1 = f"<i>Gmail Autovalidation</i>: <b>OFF</b>{mode_suffix}"
@@ -1123,12 +1123,15 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
     _ = viewer_id  # Both participants can view; kept for future role-specific variants.
     page = max(0, int(page))
     rows, has_prev, has_next = list_ranked_gmail_senders(page)
+    legend_line = (
+        f"<i>☣️ nuevo (observación) · ✅ establecido (auto {GMAIL_ZELLE_AUTO_PROMOTE_DAYS}d) "
+        "| orden: estado → freq → prom → antig.</i>"
+    )
 
     if not rows:
         return (
             "<b>📇 Zelle Senders (Top 10)</b>\n"
-            f"<i>☣️ Nuevo / en observación · ✅ Establecido (auto-promueve tras {GMAIL_ZELLE_AUTO_PROMOTE_DAYS} días)</i>\n"
-            "<i>Orden: estado → frecuencia → promedio → antigüedad</i>\n\n"
+            f"{legend_line}\n\n"
             "<i>No hay remitentes de Gmail/Zelle todavía.</i>",
             has_prev,
             has_next,
@@ -1136,8 +1139,7 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
 
     lines = [
         "<b>📇 Zelle Senders (Top 10)</b>",
-        f"<i>☣️ Nuevo / en observación · ✅ Establecido (auto-promueve tras {GMAIL_ZELLE_AUTO_PROMOTE_DAYS} días)</i>",
-        "<i>Orden: estado → frecuencia → promedio → antigüedad</i>",
+        legend_line,
         "",
     ]
 
@@ -1154,7 +1156,7 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
 
         lines.append(f"{rank_num}. {badge} <code>{display_txt}</code>")
         lines.append(
-            f"   <i>freq</i>: {seen_count} &#183; <i>prom.</i>: {avg_amount_txt} &#183; <i>últ.</i>: {last_seen_txt}"
+            f"   <i>freq</i>: {seen_count} &#183; <i>prom</i>: {avg_amount_txt} &#183; <i>últ</i>: {last_seen_txt}"
         )
 
     return "\n".join(lines), has_prev, has_next
@@ -2116,7 +2118,29 @@ def _kraken_asset_matches_target(asset_value: str | None) -> bool:
     return asset_upper == KRAKEN_ASSET or asset_upper.startswith(KRAKEN_ASSET + ".")
 
 
-def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None = None) -> str:
+def _collect_active_kraken_unlock_rows(
+    snapshot: dict,
+    render_now: datetime,
+) -> tuple[str, list[dict], Decimal]:
+    deposit_status = str(snapshot.get("deposit_estimator_status") or "")
+    if deposit_status not in {"ok", "stale"}:
+        return deposit_status, [], Decimal("0")
+
+    active_rows: list[dict] = []
+    active_total = Decimal("0")
+    for row in (snapshot.get("deposit_hold_rows_usd") or []):
+        amount_usd = _kraken_decimal_or_none(row.get("amount_usd"))
+        unlock_at = _parse_iso_utc_or_none(row.get("unlock_at_iso"))
+        if amount_usd is None or amount_usd <= 0 or unlock_at is None or unlock_at <= render_now:
+            continue
+        active_total += amount_usd
+        active_rows.append({"amount_usd": amount_usd, "unlock_at": unlock_at})
+
+    active_rows.sort(key=lambda r: r["unlock_at"])
+    return deposit_status, active_rows, active_total
+
+
+def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | None = None) -> str:
     if render_now is None:
         render_now = now_utc()
 
@@ -2130,25 +2154,18 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
 
-    deposit_status = str(snapshot.get("deposit_estimator_status") or "")
+    deposit_status, active_rows, total_usd = _collect_active_kraken_unlock_rows(snapshot, render_now)
     if deposit_status not in {"ok", "stale"}:
         return "\n".join(lines)
 
-    deposit_rows = snapshot.get("deposit_hold_rows_usd") or []
     row_lines: list[str] = []
-    active_total = Decimal("0")
-    for row in deposit_rows:
-        amount_usd = _kraken_decimal_or_none(row.get("amount_usd"))
-        unlock_at = _parse_iso_utc_or_none(row.get("unlock_at_iso"))
-        if amount_usd is None or amount_usd <= 0 or unlock_at is None or unlock_at <= render_now:
-            continue
-        active_total += amount_usd
+    for row in active_rows:
+        amount_usd = row["amount_usd"]
+        unlock_at = row["unlock_at"]
         row_lines.append(
             f"<i>{_format_usd_row_amount(amount_usd)} &#183; "
             f"{_format_countdown_short(render_now, unlock_at)} &#183; {_format_kraken_display_time_short(unlock_at)}</i>"
         )
-
-    total_usd = active_total
 
     if balance is not None:
         est_tradable = balance - total_usd
@@ -2168,6 +2185,62 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     lines.append("<i>UNLOCKS [EST USD]:</i>")
     lines.extend(row_lines)
     return "\n".join(lines)
+
+
+def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None = None) -> str:
+    if render_now is None:
+        render_now = now_utc()
+
+    balance_status = str(snapshot.get("balance_status") or "")
+    balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
+    balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
+    stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
+    lines = [f"<b>KRAKEN BALANCE:</b> {balance_str} (USDT){stale_suffix}"]
+
+    if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
+        return "\n".join(lines)
+
+    deposit_status, active_rows, total_usd = _collect_active_kraken_unlock_rows(snapshot, render_now)
+    if deposit_status not in {"ok", "stale"}:
+        return "\n".join(lines)
+
+    if balance is not None:
+        est_tradable = balance - total_usd
+        if est_tradable < 0:
+            est_tradable = Decimal("0")
+        lines.append(f"<b>KRAKEN TRADABLE [EST]:</b> {_format_kraken_amount_4(est_tradable)} (USDT)")
+
+    if not active_rows:
+        return "\n".join(lines)
+
+    if deposit_status == "stale":
+        lines.append("")
+        lines.append("<i>&#9888; Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
+
+    lines.append("")
+    lines.append(f"<i>KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
+
+    next_row = active_rows[0]
+    next_amount = next_row["amount_usd"]
+    next_unlock_at = next_row["unlock_at"]
+    lines.append(
+        f"<i>NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
+        f"{_format_countdown_short(render_now, next_unlock_at)}</i>"
+    )
+    tail = _format_kraken_display_time_short(next_unlock_at)
+    more_count = len(active_rows) - 1
+    if more_count > 0:
+        tail = f"{tail} &#183; +{more_count} más"
+    lines.append(f"<i>{tail}</i>")
+    return "\n".join(lines)
+
+
+def build_kraken_details_text() -> str:
+    return "<b>📊 Kraken Details</b>\n\n" + _format_kraken_dashboard_block_full(_kraken_state_snapshot())
+
+
+def build_kraken_details_keyboard() -> InlineKeyboardMarkup:
+    return build_back_keyboard()
 
 
 def _kraken_sign(url_path: str, nonce: str, postdata: str, api_secret_b64: str) -> str:
@@ -3543,7 +3616,12 @@ def build_panel_keyboard(viewer_id: int | None = None) -> InlineKeyboardMarkup:
         else:
             rows.append([InlineKeyboardButton("Switch to MANUAL", callback_data="trackmode:manual")])
 
-    rows.append([InlineKeyboardButton("📇 Senders", callback_data="senders")])
+    rows.append(
+        [
+            InlineKeyboardButton("📊 Kraken", callback_data="krakenview"),
+            InlineKeyboardButton("📇 Senders", callback_data="senders"),
+        ]
+    )
 
     if tracking_mode == "manual":
         rows.append([InlineKeyboardButton("✍ Custom", callback_data="custom")])
@@ -4111,6 +4189,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             text=list_text,
             reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
+        )
+        return
+
+    if data == "krakenview":
+        await edit_panel(
+            update.effective_chat.id,
+            context,
+            text=build_kraken_details_text(),
+            reply_markup=build_kraken_details_keyboard(),
         )
         return
 
