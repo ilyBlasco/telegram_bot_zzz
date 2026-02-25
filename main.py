@@ -126,6 +126,7 @@ GMAIL_ZELLE_BASK_PARSER_STRICT = (os.getenv("GMAIL_ZELLE_BASK_PARSER_STRICT", "1
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
 TRACKING_MODE_NOTIFY_DELETE_SECONDS = 15
+ADMIN_REVERSE_UI_LOOKBACK_HOURS = 24
 
 # Hard cap: only 2 participants for the whole bot
 MAX_PARTICIPANTS = 2
@@ -979,20 +980,20 @@ def _format_gmail_footer_status_block() -> str:
     snap = _gmail_zelle_status_snapshot()
     counts = get_gmail_sender_trust_counts()
     tracking_mode = _normalize_tracking_mode(str(snap.get("tracking_mode") or TRACKING_MODE_DEFAULT))
-    tracking_label = _html_escape(tracking_mode.upper())
+    mode_suffix = " (MANUAL)" if tracking_mode == "manual" else ""
 
     if not snap["enabled"] or not GMAIL_ZELLE_ENABLED:
-        line1 = "<i>Gmail Zelle</i>: <b>OFF</b>"
+        line1 = f"<i>Gmail Autovalidation</i>: <b>OFF</b>{mode_suffix}"
     else:
         cycle_status = str(snap.get("last_cycle_status") or "idle")
         state_label = "ERR" if cycle_status == "error" else "ON"
-        line1 = f"<i>Gmail Zelle</i>: <b>{state_label}</b> (<code>{tracking_label}</code>)"
+        line1 = f"<i>Gmail Autovalidation</i>: <b>{state_label}</b>{mode_suffix}"
 
     line2 = (
         f"<i>Senders</i>: ✅ {counts['approved']} "
-        f"&#183; 🟡 {counts['quarantine']}"
+        f"&#183; ☣️ {counts['quarantine']}"
     )
-    return f"{line1}\n{line2}"
+    return f"{line1}\n\n{line2}"
 
 
 def _gmail_sender_state_rank(state: str) -> int:
@@ -1010,7 +1011,7 @@ def _format_sender_list_last_seen(last_seen_dt: datetime | None) -> str:
 def _sender_state_badge(state: str) -> str:
     return {
         "approved": "✅",
-        "quarantine": "🟡",
+        "quarantine": "☣️",
     }.get(state, "•")
 
 
@@ -1125,15 +1126,18 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
 
     if not rows:
         return (
-            "<b>👥 Zelle Senders (Top 10)</b>\n\n"
+            "<b>📇 Zelle Senders (Top 10)</b>\n"
+            f"<i>☣️ Nuevo / en observación · ✅ Establecido (auto-promueve tras {GMAIL_ZELLE_AUTO_PROMOTE_DAYS} días)</i>\n"
+            "<i>Orden: estado → frecuencia → promedio → antigüedad</i>\n\n"
             "<i>No hay remitentes de Gmail/Zelle todavía.</i>",
             has_prev,
             has_next,
         )
 
     lines = [
-        "<b>👥 Zelle Senders (Top 10)</b>",
-        "<i>Ranked by state + seen + avg amount + 14d bonus</i>",
+        "<b>📇 Zelle Senders (Top 10)</b>",
+        f"<i>☣️ Nuevo / en observación · ✅ Establecido (auto-promueve tras {GMAIL_ZELLE_AUTO_PROMOTE_DAYS} días)</i>",
+        "<i>Orden: estado → frecuencia → promedio → antigüedad</i>",
         "",
     ]
 
@@ -1150,7 +1154,7 @@ def build_senders_list_text(page: int, viewer_id: int) -> tuple[str, bool, bool]
 
         lines.append(f"{rank_num}. {badge} <code>{display_txt}</code>")
         lines.append(
-            f"   <i>seen</i>: {seen_count} &#183; <i>avg</i>: {avg_amount_txt} &#183; <i>last</i>: {last_seen_txt}"
+            f"   <i>freq</i>: {seen_count} &#183; <i>prom.</i>: {avg_amount_txt} &#183; <i>últ.</i>: {last_seen_txt}"
         )
 
     return "\n".join(lines), has_prev, has_next
@@ -1220,7 +1224,12 @@ def list_recent_gmail_auto_added_events(
             """
         ).fetchall()
 
-    items = [_gmail_auto_added_event_from_row(row) for row in rows]
+    cutoff_dt = now_utc() - timedelta(hours=ADMIN_REVERSE_UI_LOOKBACK_HOURS)
+    items = [
+        item
+        for item in (_gmail_auto_added_event_from_row(row) for row in rows)
+        if (item.get("event_dt") or now_utc()) >= cutoff_dt
+    ]
     if items:
         max_page = (len(items) - 1) // page_size
         page = min(page, max_page)
@@ -1270,7 +1279,10 @@ def build_admin_reverse_list_text(page: int, viewer_id: int) -> tuple[str, list[
     rows, has_prev, has_next = list_recent_gmail_auto_added_events(page=page, page_size=ADMIN_REVERSE_PAGE_SIZE)
     if not rows:
         return (
-            "<b>🛠 Admin Reverse</b>\n\n<i>No hay transacciones auto-detectadas para revertir.</i>",
+            (
+                "<b>🛠 Admin Reverse</b>\n\n"
+                f"<i>No hay transacciones auto-detectadas para revertir (últimas {ADMIN_REVERSE_UI_LOOKBACK_HOURS}h).</i>"
+            ),
             [],
             has_prev,
             has_next,
@@ -1278,7 +1290,7 @@ def build_admin_reverse_list_text(page: int, viewer_id: int) -> tuple[str, list[
 
     lines = [
         "<b>🛠 Admin Reverse</b>",
-        "<i>Recientes auto-ingest (Gmail/Bask)</i>",
+        f"<i>Auto-ingest recientes (últimas {ADMIN_REVERSE_UI_LOOKBACK_HOURS}h)</i>",
         "",
     ]
     base_rank = (max(0, int(page)) * ADMIN_REVERSE_PAGE_SIZE) + 1
@@ -2147,10 +2159,12 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     if not row_lines:
         return "\n".join(lines)
 
+    lines.append("")
     if deposit_status == "stale":
         lines.append("<i>&#9888; Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
 
     lines.append(f"<i>KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
+    lines.append("")
     lines.append("<i>UNLOCKS [EST USD]:</i>")
     lines.extend(row_lines)
     return "\n".join(lines)
@@ -3484,6 +3498,11 @@ def build_panel_text(total_cents: int) -> str:
     fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
     kraken_block = _format_kraken_dashboard_block(_kraken_state_snapshot())
     gmail_footer_block = _format_gmail_footer_status_block()
+    tracking_mode = get_tracking_mode()
+    footer_lines = [gmail_footer_block]
+    if tracking_mode == "manual":
+        footer_lines.append(f"<i>⏳ Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s</i>")
+    gmail_footer_render = "\n\n".join(footer_lines)
 
     pending = pending_confirmations_count()
     pending_block = ""
@@ -3509,8 +3528,7 @@ def build_panel_text(total_cents: int) -> str:
         f"💵 <b>NET</b>   :: <code>${cents_to_money_str(net_cents)}</code>\n"
         f"{pending_block}\n"
         "光 ═════════════ 光\n"
-        f"{gmail_footer_block}\n\n"
-        f"<i>⏳ Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s</i>"
+        f"{gmail_footer_render}"
     )
 
 
@@ -3525,7 +3543,7 @@ def build_panel_keyboard(viewer_id: int | None = None) -> InlineKeyboardMarkup:
         else:
             rows.append([InlineKeyboardButton("Switch to MANUAL", callback_data="trackmode:manual")])
 
-    rows.append([InlineKeyboardButton("👥 Senders", callback_data="senders")])
+    rows.append([InlineKeyboardButton("📇 Senders", callback_data="senders")])
 
     if tracking_mode == "manual":
         rows.append([InlineKeyboardButton("✍ Custom", callback_data="custom")])
