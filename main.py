@@ -40,6 +40,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 FEE_PCT = Decimal(os.getenv("FEE_PCT", "0.02"))  # 2% default
 NETWORK_FEE = Decimal(os.getenv("NETWORK_FEE", "0.30"))  # $0.30 flat
 BANNER_URL = os.getenv("BANNER_URL", "").strip()  # optional public image URL
+BANNER_PATH = os.getenv("BANNER_PATH", "").strip()  # optional local image path
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "").strip()
 KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "").strip()
@@ -127,6 +128,18 @@ GMAIL_ZELLE_BASK_PARSER_STRICT = (os.getenv("GMAIL_ZELLE_BASK_PARSER_STRICT", "1
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
 TRACKING_MODE_NOTIFY_DELETE_SECONDS = 15
 ADMIN_REVERSE_UI_LOOKBACK_HOURS = 24
+RELEASE_NOTIFY_DELETE_SECONDS = max(1, int(os.getenv("RELEASE_NOTIFY_DELETE_SECONDS", "86400")))
+RELEASE_ERROR_DELETE_SECONDS = max(1, int(os.getenv("RELEASE_ERROR_DELETE_SECONDS", "10")))
+RELEASE_TRADABLE_SOURCE = (os.getenv("RELEASE_TRADABLE_SOURCE", "conservative").strip().lower() or "conservative")
+if RELEASE_TRADABLE_SOURCE not in {"conservative", "api_only", "est_only"}:
+    RELEASE_TRADABLE_SOURCE = "conservative"
+_RELEASE_TRADABLE_BUFFER_RAW = os.getenv("RELEASE_TRADABLE_BUFFER_USDT", "0").strip() or "0"
+try:
+    RELEASE_TRADABLE_BUFFER_USDT = Decimal(_RELEASE_TRADABLE_BUFFER_RAW)
+except Exception:
+    RELEASE_TRADABLE_BUFFER_USDT = Decimal("0")
+if RELEASE_TRADABLE_BUFFER_USDT < 0:
+    RELEASE_TRADABLE_BUFFER_USDT = Decimal("0")
 
 # Hard cap: only 2 participants for the whole bot
 MAX_PARTICIPANTS = 2
@@ -152,6 +165,7 @@ _GMAIL_ZELLE_ACTOR_USER_ID_WARNED = False
 _GMAIL_ZELLE_MODE_WARNED = False
 _GMAIL_ZELLE_LABEL_ID_CACHE: str | None = None
 _GMAIL_ZELLE_IMPORT_ERROR_WARNED = False
+_BANNER_PATH_WARNED = False
 
 GMAIL_ZELLE_STATUS: dict = {
     "enabled": GMAIL_ZELLE_ENABLED,
@@ -2009,6 +2023,35 @@ def _kraken_decimal_or_none(value) -> Decimal | None:
         return None
 
 
+def _format_money_decimal_2(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def _resolve_release_effective_tradable_usdt(snapshot: dict | None = None) -> tuple[Decimal | None, str]:
+    snap = snapshot or _kraken_state_snapshot()
+    api_tradable = _kraken_decimal_or_none(snap.get("api_tradable_usdt"))
+    est_tradable = _kraken_decimal_or_none(snap.get("tradable_usdt"))
+    source = RELEASE_TRADABLE_SOURCE
+
+    resolved: Decimal | None = None
+    if source == "api_only":
+        resolved = api_tradable
+    elif source == "est_only":
+        resolved = est_tradable
+    else:
+        candidates = [v for v in (api_tradable, est_tradable) if v is not None]
+        if candidates:
+            resolved = min(candidates)
+
+    if resolved is None:
+        return None, source
+
+    effective = resolved - RELEASE_TRADABLE_BUFFER_USDT
+    if effective < 0:
+        effective = Decimal("0")
+    return effective, source
+
+
 def _format_kraken_amount_int_readable(value: Decimal) -> str:
     if value > 0 and value < 1:
         return "<1"
@@ -3754,6 +3797,42 @@ async def notify(context: ContextTypes.DEFAULT_TYPE, text: str):
 # - If edit fails, we attempt to delete the old message (best-effort) and create a new one, updating the stored id.
 # This prevents "duplicate dashboards".
 
+def _resolve_banner_local_path() -> str | None:
+    global _BANNER_PATH_WARNED
+    raw = str(BANNER_PATH or "").strip()
+    if not raw:
+        return None
+    candidate = os.path.expanduser(raw)
+    if os.path.isfile(candidate) and os.access(candidate, os.R_OK):
+        return candidate
+    if not _BANNER_PATH_WARNED:
+        _BANNER_PATH_WARNED = True
+        logger.warning("BANNER_PATH not found or unreadable: %s", raw)
+    return None
+
+
+def _banner_source_available() -> bool:
+    return bool(_resolve_banner_local_path() or BANNER_URL)
+
+
+@contextlib.contextmanager
+def _open_banner_photo_payload():
+    local_path = _resolve_banner_local_path()
+    if local_path:
+        fh = None
+        try:
+            fh = open(local_path, "rb")
+            yield fh
+        finally:
+            if fh:
+                fh.close()
+        return
+    if BANNER_URL:
+        yield BANNER_URL
+        return
+    yield None
+
+
 async def edit_panel_for_app(chat_id: int, app: Application, text: str, reply_markup: InlineKeyboardMarkup):
     st = get_chat_state(chat_id)
     panel_message_id = st.get("panel_message_id")
@@ -3765,7 +3844,7 @@ async def edit_panel_for_app(chat_id: int, app: Application, text: str, reply_ma
     mode = st.get("panel_mode", "text")
 
     # Try banner caption edit if we believe it's banner
-    if mode == "banner" and BANNER_URL:
+    if mode == "banner":
         try:
             await app.bot.edit_message_caption(
                 chat_id=chat_id,
@@ -3790,19 +3869,18 @@ async def edit_panel_for_app(chat_id: int, app: Application, text: str, reply_ma
         return
     except Exception:
         # maybe it's actually a banner; try caption edit
-        if BANNER_URL:
-            try:
-                await app.bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=panel_message_id,
-                    caption=text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.HTML,
-                )
-                set_panel_mode(chat_id, "banner")
-                return
-            except Exception:
-                pass
+        try:
+            await app.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=panel_message_id,
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+            )
+            set_panel_mode(chat_id, "banner")
+            return
+        except Exception:
+            pass
 
     # If we get here, editing failed. To prevent duplicates:
     # best-effort delete old panel message, then create a fresh one and store its id.
@@ -3834,19 +3912,21 @@ async def send_or_update_panel_for_app(chat_id: int, app: Application):
         return
 
     # Create new panel: banner if configured, otherwise text
-    if BANNER_URL:
+    if _banner_source_available():
         try:
-            msg = await app.bot.send_photo(
-                chat_id=chat_id,
-                photo=BANNER_URL,
-                caption=text,
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-                disable_notification=True,
-            )
-            set_panel_mode(chat_id, "banner")
-            set_panel_message_id(chat_id, msg.message_id)
-            return
+            with _open_banner_photo_payload() as banner_photo:
+                if banner_photo is not None:
+                    msg = await app.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=banner_photo,
+                        caption=text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                        disable_notification=True,
+                    )
+                    set_panel_mode(chat_id, "banner")
+                    set_panel_message_id(chat_id, msg.message_id)
+                    return
         except Exception:
             set_panel_mode(chat_id, "text")
 
@@ -4436,14 +4516,43 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
     if data == "release":
+        guard_error_text = None
         async with STATE_LOCK:
-            release_info = release_current_total(user.id)
+            g_now = get_global_state()
+            total_cents_requested = int(g_now["total_cents"])
+            required_usdt = Decimal(total_cents_requested) / Decimal(100)
+            if required_usdt > 0:
+                effective_tradable_usdt, tradable_source = _resolve_release_effective_tradable_usdt()
+                if effective_tradable_usdt is None:
+                    guard_error_text = (
+                        "<b>No hay suficiente cantidad tradable.</b>\n"
+                        "<i>Tradable no disponible en Kraken ahora mismo.</i>"
+                    )
+                elif effective_tradable_usdt < required_usdt:
+                    guard_error_text = (
+                        "<b>No hay suficiente cantidad tradable.</b>\n"
+                        f"Disponible: <code>${_format_money_decimal_2(effective_tradable_usdt)}</code>\n"
+                        f"Requerido: <code>${cents_to_money_str(total_cents_requested)}</code>\n"
+                        f"<i>Fuente: {_html_escape(tradable_source)}</i>"
+                    )
+
+            release_info = None if guard_error_text else release_current_total(user.id)
+
+        if guard_error_text:
+            await notify_for_app(
+                context.application,
+                guard_error_text,
+                delete_seconds=RELEASE_ERROR_DELETE_SECONDS,
+            )
+            await update_all_panels(context)
+            return
 
         if not release_info:
             # Non-toxic, stable behavior: do nothing besides notifying
-            await notify(
-                context,
+            await notify_for_app(
+                context.application,
                 "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.",
+                delete_seconds=RELEASE_ERROR_DELETE_SECONDS,
             )
             await update_all_panels(context)
             return
@@ -4453,8 +4562,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         network_fee_cents = int(release_info["network_fee_cents"])
         net_cents = int(release_info["net_cents"])
 
-        await notify(
-            context,
+        await notify_for_app(
+            context.application,
             (
                 "<b>Yozu Tracker</b>\n"
                 "<b>解Release除</b>\n"
@@ -4463,6 +4572,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
                 f"Net: <code>${cents_to_money_str(net_cents)}</code>"
             ),
+            delete_seconds=RELEASE_NOTIFY_DELETE_SECONDS,
         )
 
         AWAITING_CUSTOM_AMOUNT.discard(user.id)
