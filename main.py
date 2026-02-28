@@ -89,6 +89,14 @@ except Exception:
     KRAKEN_USDTUSD_MAX_AGE_SECONDS = 900
 if KRAKEN_USDTUSD_MAX_AGE_SECONDS < 0:
     KRAKEN_USDTUSD_MAX_AGE_SECONDS = 0
+_KRAKEN_DEPOSIT_HOLD_BIAS_USDT_RAW = (os.getenv("KRAKEN_DEPOSIT_HOLD_BIAS_USDT", "0").strip() or "0")
+try:
+    KRAKEN_DEPOSIT_HOLD_BIAS_USDT = Decimal(_KRAKEN_DEPOSIT_HOLD_BIAS_USDT_RAW)
+except Exception:
+    KRAKEN_DEPOSIT_HOLD_BIAS_USDT = Decimal("0")
+KRAKEN_DEPOSIT_HOLD_BIAS_APPLY_TO_RELEASE = (
+    os.getenv("KRAKEN_DEPOSIT_HOLD_BIAS_APPLY_TO_RELEASE", "0").strip() == "1"
+)
 _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE = "ui" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "off"
 KRAKEN_DEPOSIT_ESTIMATOR_MODE = (
     os.getenv("KRAKEN_DEPOSIT_ESTIMATOR_MODE", _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE).strip().lower()
@@ -268,10 +276,12 @@ KRAKEN_CACHE: dict = {
     "last_success_at_deposit_status": None,
     "last_error_deposit_status": None,
     "countdown_refresh_bucket": None,
-    "tradable_est_deposit_usd": None,  # Decimal | None
+    "tradable_est_deposit_usd": None,  # Decimal | None (effective/display estimate)
+    "tradable_est_deposit_raw_usdt": None,  # Decimal | None (unbiased release-safe estimate)
     "tradable_est_ledger_usdt": None,  # Decimal | None
     "hold_total_deposit_usd": None,  # Decimal | None
-    "hold_total_deposit_usdt_est": None,  # Decimal | None
+    "hold_total_deposit_usdt_est": None,  # Decimal | None (unbiased)
+    "hold_total_deposit_usdt_est_effective": None,  # Decimal | None (after bias)
     "hold_total_ledger_usdt": None,  # Decimal | None
     "usdtusd_rate": None,  # Decimal | None
     "usdtusd_pair_used": None,  # str | None
@@ -2111,7 +2121,7 @@ def _format_money_decimal_2(value: Decimal) -> str:
 def _resolve_release_effective_tradable_usdt(snapshot: dict | None = None) -> tuple[Decimal | None, str]:
     snap = snapshot or _kraken_state_snapshot()
     api_tradable = _kraken_decimal_or_none(snap.get("api_tradable_usdt"))
-    hold_est_tradable = _resolve_active_estimated_tradable(snap, now_utc())
+    hold_est_tradable = _resolve_active_estimated_tradable(snap, now_utc(), for_release=True)
     source = RELEASE_TRADABLE_SOURCE
 
     resolved: Decimal | None = None
@@ -2289,7 +2299,20 @@ def _collect_active_kraken_unlock_rows(
     return deposit_status, active_rows, active_total
 
 
-def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | None = None) -> Decimal | None:
+def _apply_deposit_hold_bias_usdt(hold_total_usdt: Decimal | None) -> Decimal | None:
+    if hold_total_usdt is None:
+        return None
+    adjusted = hold_total_usdt + KRAKEN_DEPOSIT_HOLD_BIAS_USDT
+    if adjusted < 0:
+        adjusted = Decimal("0")
+    return adjusted
+
+
+def _compute_hold_estimate_tradable_usdt(
+    snapshot: dict,
+    render_now: datetime | None = None,
+    use_bias: bool = True,
+) -> Decimal | None:
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "off":
         return None
     if render_now is None:
@@ -2301,7 +2324,8 @@ def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | 
     if deposit_status not in {"ok", "stale"}:
         return None
 
-    hold_total_usdt_est = _kraken_decimal_or_none(snapshot.get("hold_total_deposit_usdt_est"))
+    hold_total_key = "hold_total_deposit_usdt_est_effective" if use_bias else "hold_total_deposit_usdt_est"
+    hold_total_usdt_est = _kraken_decimal_or_none(snapshot.get(hold_total_key))
     if hold_total_usdt_est is None:
         if total_usd <= 0:
             hold_total_usdt_est = Decimal("0")
@@ -2312,6 +2336,8 @@ def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | 
             hold_total_usdt_est = total_usd / fx_rate
         else:
             hold_total_usdt_est = total_usd
+        if use_bias:
+            hold_total_usdt_est = _apply_deposit_hold_bias_usdt(hold_total_usdt_est)
 
     est_tradable = balance - hold_total_usdt_est
     if est_tradable < 0:
@@ -2345,7 +2371,11 @@ def _compute_ledger_estimate_tradable_usdt(snapshot: dict) -> Decimal | None:
     return est_tradable
 
 
-def _resolve_active_estimated_tradable(snapshot: dict | None = None, render_now: datetime | None = None) -> Decimal | None:
+def _resolve_active_estimated_tradable(
+    snapshot: dict | None = None,
+    render_now: datetime | None = None,
+    for_release: bool = False,
+) -> Decimal | None:
     snap = snapshot or _kraken_state_snapshot()
     model = KRAKEN_TRADABLE_MODEL
     if model == "ledger_usdt":
@@ -2354,10 +2384,16 @@ def _resolve_active_estimated_tradable(snapshot: dict | None = None, render_now:
             return ledger_est
         return _compute_ledger_estimate_tradable_usdt(snap)
 
+    if for_release and not KRAKEN_DEPOSIT_HOLD_BIAS_APPLY_TO_RELEASE:
+        deposit_est = _kraken_decimal_or_none(snap.get("tradable_est_deposit_raw_usdt"))
+        if deposit_est is not None:
+            return deposit_est
+        return _compute_hold_estimate_tradable_usdt(snap, render_now, use_bias=False)
+
     deposit_est = _kraken_decimal_or_none(snap.get("tradable_est_deposit_usd"))
     if deposit_est is not None:
         return deposit_est
-    return _compute_hold_estimate_tradable_usdt(snap, render_now)
+    return _compute_hold_estimate_tradable_usdt(snap, render_now, use_bias=True)
 
 
 def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | None = None) -> str:
@@ -3156,6 +3192,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             KRAKEN_CACHE["usdtusd_pair_used"] = None
             KRAKEN_CACHE["last_error_usdtusd"] = None
             KRAKEN_CACHE["hold_total_deposit_usdt_est"] = None
+            KRAKEN_CACHE["hold_total_deposit_usdt_est_effective"] = None
         else:
             try:
                 pair_used, usdtusd_rate = await asyncio.to_thread(_kraken_public_get_ticker_usdtusd_sync)
@@ -3278,8 +3315,19 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                     hold_total_deposit_usdt_est = deposit_hold_total_usd / fx_rate
             else:
                 hold_total_deposit_usdt_est = deposit_hold_total_usd
+        hold_total_deposit_usdt_est_effective = _apply_deposit_hold_bias_usdt(hold_total_deposit_usdt_est)
         KRAKEN_CACHE["hold_total_deposit_usdt_est"] = hold_total_deposit_usdt_est
-        KRAKEN_CACHE["tradable_est_deposit_usd"] = _compute_hold_estimate_tradable_usdt(KRAKEN_CACHE, refresh_now)
+        KRAKEN_CACHE["hold_total_deposit_usdt_est_effective"] = hold_total_deposit_usdt_est_effective
+        KRAKEN_CACHE["tradable_est_deposit_raw_usdt"] = _compute_hold_estimate_tradable_usdt(
+            KRAKEN_CACHE,
+            refresh_now,
+            use_bias=False,
+        )
+        KRAKEN_CACHE["tradable_est_deposit_usd"] = _compute_hold_estimate_tradable_usdt(
+            KRAKEN_CACHE,
+            refresh_now,
+            use_bias=True,
+        )
 
         ledger_shadow_active = KRAKEN_LEDGER_SHADOW_ENABLED or KRAKEN_TRADABLE_MODEL == "ledger_usdt"
         if not ledger_shadow_active:
@@ -3381,9 +3429,13 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             return "--" if value is None else _format_kraken_amount_4(value)
 
         deposit_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_deposit_usd"))
+        deposit_est_raw_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_deposit_raw_usdt"))
         ledger_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_ledger_usdt"))
         hold_deposit_usd_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("hold_total_deposit_usd"))
         hold_deposit_usdt_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("hold_total_deposit_usdt_est"))
+        hold_deposit_usdt_est_effective_for_log = _kraken_decimal_or_none(
+            KRAKEN_CACHE.get("hold_total_deposit_usdt_est_effective")
+        )
         fx_rate_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("usdtusd_rate"))
         fx_pair_for_log = str(KRAKEN_CACHE.get("usdtusd_pair_used") or "--")
         fx_status_for_log = str(KRAKEN_CACHE.get("usdtusd_status") or "disabled")
@@ -3395,10 +3447,11 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             delta_dep_vs_api = deposit_est_for_log - api_tradable_for_delta
 
         logger.info(
-            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s fx_status=%s fx_pair=%s fx_rate=%s hold_deposit_usd=%s hold_deposit_usdt_est=%s ledger_offset=%s burnin_days=%s pos_filter=%s",
+            "Kraken tradable estimate compare model=%s active=%s deposit=%s deposit_raw=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s fx_status=%s fx_pair=%s fx_rate=%s hold_deposit_usd=%s hold_deposit_usdt_est=%s hold_deposit_usdt_est_effective=%s hold_bias_usdt=%s bias_applied_to_release=%s ledger_offset=%s burnin_days=%s pos_filter=%s",
             KRAKEN_TRADABLE_MODEL,
             _fmt_est_log(active_est_tradable),
             _fmt_est_log(deposit_est_for_log),
+            _fmt_est_log(deposit_est_raw_for_log),
             _fmt_est_log(ledger_est_for_log),
             _fmt_est_log(api_tradable_for_delta),
             _fmt_est_log(_kraken_decimal_or_none(KRAKEN_CACHE.get("estimator_delta_usdt"))),
@@ -3409,6 +3462,9 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             _fmt_est_log(fx_rate_for_log),
             _fmt_est_log(hold_deposit_usd_for_log),
             _fmt_est_log(hold_deposit_usdt_est_for_log),
+            _fmt_est_log(hold_deposit_usdt_est_effective_for_log),
+            _fmt_est_log(KRAKEN_DEPOSIT_HOLD_BIAS_USDT),
+            "1" if KRAKEN_DEPOSIT_HOLD_BIAS_APPLY_TO_RELEASE else "0",
             KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
             KRAKEN_LEDGER_BURNIN_DAYS,
             ",".join(sorted(KRAKEN_LEDGER_POSITIVE_TYPES_SET)) if KRAKEN_LEDGER_POSITIVE_TYPES_SET else "*",
