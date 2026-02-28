@@ -2305,7 +2305,7 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     next_amount = next_row["amount_usd"]
     next_unlock_at = next_row["unlock_at"]
     lines.append(
-        f"<i>\NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
+        f"<i>\U0001F991 NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
         f"{_format_countdown_short(render_now, next_unlock_at)}</i>"
     )
     tail = _format_kraken_display_time_short(next_unlock_at)
