@@ -66,6 +66,29 @@ KRAKEN_TRADABLE_MODEL = (os.getenv("KRAKEN_TRADABLE_MODEL", "deposit_usd").strip
 if KRAKEN_TRADABLE_MODEL not in {"deposit_usd", "ledger_usdt"}:
     KRAKEN_TRADABLE_MODEL = "deposit_usd"
 KRAKEN_LEDGER_SHADOW_ENABLED = (os.getenv("KRAKEN_LEDGER_SHADOW_ENABLED", "1").strip() != "0")
+KRAKEN_DEPOSIT_FX_ENABLED = (os.getenv("KRAKEN_DEPOSIT_FX_ENABLED", "1").strip() != "0")
+_KRAKEN_USDTUSD_PAIR_CANDIDATES_RAW = (
+    os.getenv("KRAKEN_USDTUSD_PAIR_CANDIDATES", "USDTUSD,USDTZUSD").strip() or "USDTUSD,USDTZUSD"
+)
+_KRAKEN_USDTUSD_PAIR_CANDIDATES_SEEN: set[str] = set()
+KRAKEN_USDTUSD_PAIR_CANDIDATES: tuple[str, ...] = tuple(
+    pair
+    for pair in (
+        part.strip().upper()
+        for part in _KRAKEN_USDTUSD_PAIR_CANDIDATES_RAW.replace(";", ",").split(",")
+        if part.strip()
+    )
+    if not (pair in _KRAKEN_USDTUSD_PAIR_CANDIDATES_SEEN or _KRAKEN_USDTUSD_PAIR_CANDIDATES_SEEN.add(pair))
+)
+if not KRAKEN_USDTUSD_PAIR_CANDIDATES:
+    KRAKEN_USDTUSD_PAIR_CANDIDATES = ("USDTUSD", "USDTZUSD")
+_KRAKEN_USDTUSD_MAX_AGE_SECONDS_RAW = (os.getenv("KRAKEN_USDTUSD_MAX_AGE_SECONDS", "900").strip() or "900")
+try:
+    KRAKEN_USDTUSD_MAX_AGE_SECONDS = int(_KRAKEN_USDTUSD_MAX_AGE_SECONDS_RAW)
+except Exception:
+    KRAKEN_USDTUSD_MAX_AGE_SECONDS = 900
+if KRAKEN_USDTUSD_MAX_AGE_SECONDS < 0:
+    KRAKEN_USDTUSD_MAX_AGE_SECONDS = 0
 _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE = "ui" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "off"
 KRAKEN_DEPOSIT_ESTIMATOR_MODE = (
     os.getenv("KRAKEN_DEPOSIT_ESTIMATOR_MODE", _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE).strip().lower()
@@ -126,6 +149,7 @@ KRAKEN_API_BASE = "https://api.kraken.com"
 KRAKEN_BALANCE_EX_PATH = "/0/private/BalanceEx"
 KRAKEN_LEDGERS_PATH = "/0/private/Ledgers"
 KRAKEN_DEPOSIT_STATUS_PATH = "/0/private/DepositStatus"
+KRAKEN_TICKER_PATH = "/0/public/Ticker"
 
 GMAIL_ZELLE_ENABLED = (os.getenv("GMAIL_ZELLE_ENABLED", "0").strip() == "1")
 _GMAIL_ZELLE_MODE_DEFAULT = "shadow"
@@ -247,7 +271,13 @@ KRAKEN_CACHE: dict = {
     "tradable_est_deposit_usd": None,  # Decimal | None
     "tradable_est_ledger_usdt": None,  # Decimal | None
     "hold_total_deposit_usd": None,  # Decimal | None
+    "hold_total_deposit_usdt_est": None,  # Decimal | None
     "hold_total_ledger_usdt": None,  # Decimal | None
+    "usdtusd_rate": None,  # Decimal | None
+    "usdtusd_pair_used": None,  # str | None
+    "usdtusd_status": "disabled",
+    "last_success_at_usdtusd": None,
+    "last_error_usdtusd": None,
     "estimator_delta_usdt": None,  # Decimal | None (active estimator vs API tradable)
     "estimator_source_active": KRAKEN_TRADABLE_MODEL,
 }
@@ -2270,9 +2300,24 @@ def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | 
     deposit_status, _active_rows, total_usd = _collect_active_kraken_unlock_rows(snapshot, render_now)
     if deposit_status not in {"ok", "stale"}:
         return None
-    est_tradable = balance - total_usd
+
+    hold_total_usdt_est = _kraken_decimal_or_none(snapshot.get("hold_total_deposit_usdt_est"))
+    if hold_total_usdt_est is None:
+        if total_usd <= 0:
+            hold_total_usdt_est = Decimal("0")
+        elif KRAKEN_DEPOSIT_FX_ENABLED:
+            fx_rate = _kraken_decimal_or_none(snapshot.get("usdtusd_rate"))
+            if fx_rate is None or fx_rate <= 0:
+                return None
+            hold_total_usdt_est = total_usd / fx_rate
+        else:
+            hold_total_usdt_est = total_usd
+
+    est_tradable = balance - hold_total_usdt_est
     if est_tradable < 0:
         est_tradable = Decimal("0")
+    if est_tradable > balance:
+        est_tradable = balance
     return est_tradable
 
 
@@ -2419,6 +2464,86 @@ def _kraken_sign(url_path: str, nonce: str, postdata: str, api_secret_b64: str) 
     message = url_path.encode("utf-8") + sha256_digest
     sig = hmac.new(secret, message, hashlib.sha512).digest()
     return base64.b64encode(sig).decode("utf-8")
+
+
+def _kraken_public_get_sync(url_path: str, params: dict | None = None) -> dict:
+    query = urllib_parse.urlencode({str(k): str(v) for k, v in (params or {}).items() if v is not None})
+    url = f"{KRAKEN_API_BASE}{url_path}"
+    if query:
+        url = f"{url}?{query}"
+
+    req = urllib_request.Request(
+        url=url,
+        headers={
+            "User-Agent": "telegram_bot_zzz/kraken-balance",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib_request.urlopen(req, timeout=KRAKEN_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib_error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        body_short = body[:200].replace("\n", " ").strip()
+        raise RuntimeError(f"Kraken HTTP {e.code}: {body_short or e.reason}") from e
+    except urllib_error.URLError as e:
+        raise RuntimeError(f"Kraken network error: {e.reason}") from e
+
+    try:
+        payload = json.loads(body)
+    except Exception as e:
+        raise RuntimeError("Kraken returned invalid JSON") from e
+
+    errors = payload.get("error") or []
+    if errors:
+        msg = "; ".join(str(x) for x in errors)
+        raise RuntimeError(f"Kraken API error: {msg}")
+    if "result" not in payload:
+        raise RuntimeError("Kraken response missing result")
+    return payload
+
+
+def _kraken_public_get_ticker_usdtusd_sync() -> tuple[str, Decimal]:
+    last_error: Exception | None = None
+    for pair in KRAKEN_USDTUSD_PAIR_CANDIDATES:
+        try:
+            payload = _kraken_public_get_sync(KRAKEN_TICKER_PATH, {"pair": pair})
+            result = payload.get("result") or {}
+            if not isinstance(result, dict) or not result:
+                raise RuntimeError("Kraken ticker result missing pair data")
+
+            pair_key = pair
+            ticker = result.get(pair)
+            if not isinstance(ticker, dict):
+                first_key = next(iter(result.keys()), None)
+                maybe_ticker = result.get(first_key) if first_key is not None else None
+                if not isinstance(maybe_ticker, dict):
+                    raise RuntimeError("Kraken ticker payload missing ticker object")
+                pair_key = str(first_key)
+                ticker = maybe_ticker
+
+            rate: Decimal | None = None
+            for key in ("c", "p", "a", "b"):
+                raw = ticker.get(key)
+                candidate = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
+                parsed = _kraken_decimal_or_none(candidate)
+                if parsed is not None and parsed > 0:
+                    rate = parsed
+                    break
+
+            if rate is None or rate <= 0:
+                raise RuntimeError(f"Kraken ticker pair {pair_key} missing valid price")
+            return pair_key, rate
+        except Exception as e:
+            last_error = e
+            continue
+
+    msg = str(last_error) if last_error is not None else "no ticker candidates configured"
+    raise RuntimeError(f"Kraken USDTUSD ticker unavailable: {msg}")
 
 
 def _kraken_private_post_sync(url_path: str, extra_form: dict | None = None) -> dict:
@@ -3025,6 +3150,49 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                 _format_kraken_amount_4(locked_usdt),
             )
 
+        if not KRAKEN_DEPOSIT_FX_ENABLED:
+            KRAKEN_CACHE["usdtusd_status"] = "disabled"
+            KRAKEN_CACHE["usdtusd_rate"] = None
+            KRAKEN_CACHE["usdtusd_pair_used"] = None
+            KRAKEN_CACHE["last_error_usdtusd"] = None
+            KRAKEN_CACHE["hold_total_deposit_usdt_est"] = None
+        else:
+            try:
+                pair_used, usdtusd_rate = await asyncio.to_thread(_kraken_public_get_ticker_usdtusd_sync)
+            except Exception as e:
+                cached_rate = _kraken_decimal_or_none(KRAKEN_CACHE.get("usdtusd_rate"))
+                last_success_raw = KRAKEN_CACHE.get("last_success_at_usdtusd")
+                last_success_dt = _parse_iso_utc_or_none(str(last_success_raw)) if last_success_raw else None
+                is_fresh_cached = (
+                    cached_rate is not None
+                    and last_success_dt is not None
+                    and (refresh_now - last_success_dt).total_seconds() <= KRAKEN_USDTUSD_MAX_AGE_SECONDS
+                )
+                KRAKEN_CACHE["last_error_usdtusd"] = str(e)[:200]
+                if is_fresh_cached:
+                    KRAKEN_CACHE["usdtusd_status"] = "stale"
+                    logger.info(
+                        "Kraken USDTUSD rate refreshed pair=%s rate=%s status=stale",
+                        KRAKEN_CACHE.get("usdtusd_pair_used") or "--",
+                        _format_kraken_amount_4(cached_rate),
+                    )
+                else:
+                    KRAKEN_CACHE["usdtusd_status"] = "error"
+                    KRAKEN_CACHE["usdtusd_rate"] = None
+                    KRAKEN_CACHE["usdtusd_pair_used"] = None
+                    logger.warning("Kraken USDTUSD rate refresh failed: %s", KRAKEN_CACHE["last_error_usdtusd"])
+            else:
+                KRAKEN_CACHE["usdtusd_status"] = "ok"
+                KRAKEN_CACHE["usdtusd_rate"] = usdtusd_rate
+                KRAKEN_CACHE["usdtusd_pair_used"] = pair_used
+                KRAKEN_CACHE["last_success_at_usdtusd"] = now_utc_iso()
+                KRAKEN_CACHE["last_error_usdtusd"] = None
+                logger.info(
+                    "Kraken USDTUSD rate refreshed pair=%s rate=%s status=ok",
+                    pair_used,
+                    _format_kraken_amount_4(usdtusd_rate),
+                )
+
         if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "off":
             KRAKEN_CACHE["deposit_estimator_status"] = "disabled"
             KRAKEN_CACHE["deposit_hold_rows_usd"] = []
@@ -3100,6 +3268,17 @@ async def refresh_kraken_cache_once(app: Application) -> None:
         # Keep explicit cache fields for model diagnostics and UI/release consumption.
         deposit_hold_total_usd = _kraken_decimal_or_none(KRAKEN_CACHE.get("deposit_hold_total_usd"))
         KRAKEN_CACHE["hold_total_deposit_usd"] = deposit_hold_total_usd
+        hold_total_deposit_usdt_est: Decimal | None = None
+        if deposit_hold_total_usd is not None:
+            if deposit_hold_total_usd <= 0:
+                hold_total_deposit_usdt_est = Decimal("0")
+            elif KRAKEN_DEPOSIT_FX_ENABLED:
+                fx_rate = _kraken_decimal_or_none(KRAKEN_CACHE.get("usdtusd_rate"))
+                if fx_rate is not None and fx_rate > 0:
+                    hold_total_deposit_usdt_est = deposit_hold_total_usd / fx_rate
+            else:
+                hold_total_deposit_usdt_est = deposit_hold_total_usd
+        KRAKEN_CACHE["hold_total_deposit_usdt_est"] = hold_total_deposit_usdt_est
         KRAKEN_CACHE["tradable_est_deposit_usd"] = _compute_hold_estimate_tradable_usdt(KRAKEN_CACHE, refresh_now)
 
         ledger_shadow_active = KRAKEN_LEDGER_SHADOW_ENABLED or KRAKEN_TRADABLE_MODEL == "ledger_usdt"
@@ -3203,6 +3382,11 @@ async def refresh_kraken_cache_once(app: Application) -> None:
 
         deposit_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_deposit_usd"))
         ledger_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_ledger_usdt"))
+        hold_deposit_usd_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("hold_total_deposit_usd"))
+        hold_deposit_usdt_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("hold_total_deposit_usdt_est"))
+        fx_rate_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("usdtusd_rate"))
+        fx_pair_for_log = str(KRAKEN_CACHE.get("usdtusd_pair_used") or "--")
+        fx_status_for_log = str(KRAKEN_CACHE.get("usdtusd_status") or "disabled")
         delta_dep_vs_led = None
         if deposit_est_for_log is not None and ledger_est_for_log is not None:
             delta_dep_vs_led = deposit_est_for_log - ledger_est_for_log
@@ -3211,7 +3395,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             delta_dep_vs_api = deposit_est_for_log - api_tradable_for_delta
 
         logger.info(
-            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s ledger_offset=%s burnin_days=%s pos_filter=%s",
+            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s fx_status=%s fx_pair=%s fx_rate=%s hold_deposit_usd=%s hold_deposit_usdt_est=%s ledger_offset=%s burnin_days=%s pos_filter=%s",
             KRAKEN_TRADABLE_MODEL,
             _fmt_est_log(active_est_tradable),
             _fmt_est_log(deposit_est_for_log),
@@ -3220,6 +3404,11 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             _fmt_est_log(_kraken_decimal_or_none(KRAKEN_CACHE.get("estimator_delta_usdt"))),
             _fmt_est_log(delta_dep_vs_led),
             _fmt_est_log(delta_dep_vs_api),
+            fx_status_for_log,
+            fx_pair_for_log,
+            _fmt_est_log(fx_rate_for_log),
+            _fmt_est_log(hold_deposit_usd_for_log),
+            _fmt_est_log(hold_deposit_usdt_est_for_log),
             KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
             KRAKEN_LEDGER_BURNIN_DAYS,
             ",".join(sorted(KRAKEN_LEDGER_POSITIVE_TYPES_SET)) if KRAKEN_LEDGER_POSITIVE_TYPES_SET else "*",
