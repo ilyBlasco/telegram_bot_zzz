@@ -197,6 +197,8 @@ GMAIL_ZELLE_BASK_ALLOWED_SENDER_EMAILS_SET = {
 }
 GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS = (os.getenv("GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS", "").strip() or "")
 GMAIL_ZELLE_BASK_PARSER_STRICT = (os.getenv("GMAIL_ZELLE_BASK_PARSER_STRICT", "1").strip() != "0")
+GMAIL_ZELLE_PAYER_KEY_ALLOWLIST_RAW = (os.getenv("GMAIL_ZELLE_PAYER_KEY_ALLOWLIST", "").strip() or "")
+GMAIL_ZELLE_PAYER_KEY_BLOCKLIST_RAW = (os.getenv("GMAIL_ZELLE_PAYER_KEY_BLOCKLIST", "").strip() or "")
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
@@ -790,6 +792,19 @@ def _normalize_payer_key(value: str | None) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = re.sub(r"\s+", " ", text).strip()
     return text.lower()
+
+
+def _parse_gmail_payer_key_set(raw_value: str | None) -> set[str]:
+    out: set[str] = set()
+    for raw_part in str(raw_value or "").replace(";", ",").split(","):
+        normalized = _normalize_payer_key(raw_part)
+        if normalized:
+            out.add(normalized)
+    return out
+
+
+GMAIL_ZELLE_PAYER_KEY_ALLOWLIST_SET = _parse_gmail_payer_key_set(GMAIL_ZELLE_PAYER_KEY_ALLOWLIST_RAW)
+GMAIL_ZELLE_PAYER_KEY_BLOCKLIST_SET = _parse_gmail_payer_key_set(GMAIL_ZELLE_PAYER_KEY_BLOCKLIST_RAW)
 
 
 def _json_dumps_compact(data: dict | None) -> str | None:
@@ -3788,6 +3803,23 @@ def parse_zelle_email_from_gmail_message(msg: dict) -> tuple[dict, str]:
     return parsed, "ok"
 
 
+def _gmail_route_identity_key(parsed: dict) -> str:
+    for key in ("identity_key", "payer_key", "payer_display", "sender_display_name"):
+        candidate = str(parsed.get(key) or "").strip()
+        if candidate:
+            return _normalize_payer_key(candidate)
+    return ""
+
+
+def _gmail_route_accepts(parsed: dict) -> tuple[bool, str, str]:
+    route_key = _gmail_route_identity_key(parsed)
+    if GMAIL_ZELLE_PAYER_KEY_ALLOWLIST_SET and route_key not in GMAIL_ZELLE_PAYER_KEY_ALLOWLIST_SET:
+        return False, route_key, "allowlist_miss"
+    if route_key in GMAIL_ZELLE_PAYER_KEY_BLOCKLIST_SET:
+        return False, route_key, "blocklist_match"
+    return True, route_key, "accepted"
+
+
 def _gmail_get_service_sync():
     global _GMAIL_ZELLE_IMPORT_ERROR_WARNED
     try:
@@ -3991,6 +4023,7 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
         "quarantined": 0,
         "blocked": 0,
         "shadow": 0,
+        "route_ignored": 0,
         "ignored_unmatched": 0,
         "parse_error": 0,
         "duplicate": 0,
@@ -4015,6 +4048,28 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
                 counts["duplicate"] += 1
             else:
                 counts["ignored_unmatched"] += 1
+            continue
+
+        route_ok, route_key, route_reason = _gmail_route_accepts(parsed)
+        if not route_ok:
+            identity_display = str(
+                parsed.get("identity_display")
+                or parsed.get("payer_display")
+                or parsed.get("sender_display_name")
+                or ""
+            ).strip()
+            route_notes = _json_dumps_compact(
+                {
+                    "route_key": route_key,
+                    "route_reason": route_reason,
+                    "identity_display": identity_display,
+                }
+            )
+            record_result = record_gmail_processed_message_tx(parsed, "ignored_route_miss", notes=route_notes)
+            if record_result["status"] == "duplicate":
+                counts["duplicate"] += 1
+            else:
+                counts["route_ignored"] += 1
             continue
 
         async with STATE_LOCK:
@@ -4086,17 +4141,19 @@ async def refresh_gmail_zelle_once(app: Application) -> None:
         or counts["quarantined"]
         or counts["blocked"]
         or counts["shadow"]
+        or counts["route_ignored"]
         or counts["ignored_unmatched"]
         or counts["parse_error"]
     ):
         logger.info(
-            "Gmail Zelle poll summary: listed=%s fetched=%s added=%s quarantined=%s blocked=%s shadow=%s unmatched=%s parse_error=%s duplicate=%s mode=%s tracking_mode=%s",
+            "Gmail Zelle poll summary: listed=%s fetched=%s added=%s quarantined=%s blocked=%s shadow=%s route_ignored=%s unmatched=%s parse_error=%s duplicate=%s mode=%s tracking_mode=%s",
             counts["listed"],
             counts["fetched"],
             counts["added"],
             counts["quarantined"],
             counts["blocked"],
             counts["shadow"],
+            counts["route_ignored"],
             counts["ignored_unmatched"],
             counts["parse_error"],
             counts["duplicate"],
