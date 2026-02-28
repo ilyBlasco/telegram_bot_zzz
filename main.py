@@ -2054,6 +2054,30 @@ def _resolve_release_effective_tradable_usdt(snapshot: dict | None = None) -> tu
     return effective, source
 
 
+def _compute_release_readiness(total_cents: int, snapshot: dict | None = None) -> dict:
+    snap = snapshot or _kraken_state_snapshot()
+    required_usdt = Decimal(max(0, int(total_cents))) / Decimal("100")
+    available_usdt, source = _resolve_release_effective_tradable_usdt(snap)
+    if available_usdt is None:
+        return {
+            "available_usdt": None,
+            "required_usdt": required_usdt,
+            "missing_usdt": Decimal("0"),
+            "is_ready": False,
+            "source": source,
+        }
+    missing_usdt = required_usdt - available_usdt
+    if missing_usdt < 0:
+        missing_usdt = Decimal("0")
+    return {
+        "available_usdt": available_usdt,
+        "required_usdt": required_usdt,
+        "missing_usdt": missing_usdt,
+        "is_ready": missing_usdt == 0,
+        "source": source,
+    }
+
+
 def _format_kraken_amount_int_readable(value: Decimal) -> str:
     if value > 0 and value < 1:
         return "<1"
@@ -2208,13 +2232,9 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
 
     balance_status = str(snapshot.get("balance_status") or "")
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
-    api_tradable = _kraken_decimal_or_none(snapshot.get("api_tradable_usdt"))
-
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
     lines = [f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"]
-    if api_tradable is not None:
-        lines.append(f"<b>KRAKEN TRADABLE [API]: {_format_kraken_amount_4(api_tradable)} (USDT)</b>")
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -2256,12 +2276,9 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
 
     balance_status = str(snapshot.get("balance_status") or "")
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
-    api_tradable = _kraken_decimal_or_none(snapshot.get("api_tradable_usdt"))
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
     lines = [f"<b>KRAKEN BALANCE:</b> {balance_str} (USDT){stale_suffix}"]
-    if api_tradable is not None:
-        lines.append(f"<b>KRAKEN TRADABLE [API]:</b> {_format_kraken_amount_4(api_tradable)} (USDT)")
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -3633,7 +3650,24 @@ async def gmail_zelle_poll_loop(app: Application) -> None:
 
 def build_panel_text(total_cents: int) -> str:
     fee_cents, network_fee_cents, net_cents = compute_fee_net(total_cents)
-    kraken_block = _format_kraken_dashboard_block(_kraken_state_snapshot())
+    kraken_snapshot = _kraken_state_snapshot()
+    kraken_block = _format_kraken_dashboard_block(kraken_snapshot)
+    readiness = _compute_release_readiness(total_cents, kraken_snapshot)
+    release_lines: list[str] = []
+    available_usdt = readiness.get("available_usdt")
+    if isinstance(available_usdt, Decimal):
+        release_lines.append(f"<i>Release disponible ahora: <code>${_format_money_decimal_2(available_usdt)}</code></i>")
+        if readiness.get("is_ready"):
+            release_lines.append("<i>Listo para liberar TOTAL</i>")
+        else:
+            missing_usdt = readiness.get("missing_usdt")
+            if isinstance(missing_usdt, Decimal) and missing_usdt > 0:
+                release_lines.append(
+                    f"<i>Falta para liberar TOTAL: <code>${_format_money_decimal_2(missing_usdt)}</code></i>"
+                )
+    else:
+        release_lines.append("<i>Release disponible ahora: -- (estimador no disponible)</i>")
+    release_readiness_block = "\n".join(release_lines)
     gmail_footer_block = _format_gmail_footer_status_block()
     tracking_mode = get_tracking_mode()
     footer_lines = [gmail_footer_block]
@@ -3657,7 +3691,8 @@ def build_panel_text(total_cents: int) -> str:
             )
 
     return (
-        f"{kraken_block}\n\n"
+        f"{kraken_block}\n"
+        f"{release_readiness_block}\n\n"
         "光 ═════════════ 光\n\n"
         f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
         f"<b>費 Fee</b> ({(FEE_PCT * 100):.0f}%) :: <code>${cents_to_money_str(fee_cents)}</code>\n"
