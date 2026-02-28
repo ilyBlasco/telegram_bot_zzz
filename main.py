@@ -49,6 +49,19 @@ KRAKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("KRAKEN_TIMEOUT_SECONDS", "10")))
 KRAKEN_ASSET = (os.getenv("KRAKEN_ASSET", "USDT").strip().upper() or "USDT")
 KRAKEN_HOLD_DAYS = max(1, int(os.getenv("KRAKEN_HOLD_DAYS", "8")))
 KRAKEN_LEDGER_MAX_PAGES = max(1, int(os.getenv("KRAKEN_LEDGER_MAX_PAGES", "10")))
+_KRAKEN_LEDGER_BURNIN_DAYS_RAW = (os.getenv("KRAKEN_LEDGER_BURNIN_DAYS", "45").strip() or "45")
+_KRAKEN_LEDGER_BURNIN_DAYS_INVALID = False
+try:
+    KRAKEN_LEDGER_BURNIN_DAYS = int(_KRAKEN_LEDGER_BURNIN_DAYS_RAW)
+except Exception:
+    KRAKEN_LEDGER_BURNIN_DAYS = 45
+    _KRAKEN_LEDGER_BURNIN_DAYS_INVALID = True
+if KRAKEN_LEDGER_BURNIN_DAYS < 0:
+    KRAKEN_LEDGER_BURNIN_DAYS = 0
+    _KRAKEN_LEDGER_BURNIN_DAYS_INVALID = True
+elif KRAKEN_LEDGER_BURNIN_DAYS > 180:
+    KRAKEN_LEDGER_BURNIN_DAYS = 180
+    _KRAKEN_LEDGER_BURNIN_DAYS_INVALID = True
 KRAKEN_TRADABLE_MODEL = (os.getenv("KRAKEN_TRADABLE_MODEL", "deposit_usd").strip().lower() or "deposit_usd")
 if KRAKEN_TRADABLE_MODEL not in {"deposit_usd", "ledger_usdt"}:
     KRAKEN_TRADABLE_MODEL = "deposit_usd"
@@ -192,6 +205,7 @@ _KRAKEN_DISPLAY_TZ_WARNED = False
 _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED = False
 _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED = False
 _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED = False
+_KRAKEN_LEDGER_BURNIN_DAYS_WARNED = False
 _GMAIL_ZELLE_ACTOR_USER_ID_WARNED = False
 _GMAIL_ZELLE_MODE_WARNED = False
 _GMAIL_ZELLE_LABEL_ID_CACHE: str | None = None
@@ -2807,7 +2821,7 @@ def _extract_usdt_ledger_events(payload: dict) -> list[dict]:
 
 
 def _fetch_usdt_ledger_events_with_pagination(fetch_now: datetime) -> tuple[list[dict], bool]:
-    cutoff = fetch_now - timedelta(days=KRAKEN_HOLD_DAYS)
+    cutoff = fetch_now - timedelta(days=KRAKEN_HOLD_DAYS + KRAKEN_LEDGER_BURNIN_DAYS)
     ofs = 0
     all_events: list[dict] = []
     hit_cap = True
@@ -2912,7 +2926,7 @@ def _estimate_unlock_rows_fifo(events: list[dict], now_dt: datetime) -> list[dic
 
 
 async def refresh_kraken_cache_once(app: Application) -> None:
-    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED, _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED, _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED
+    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED, _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED, _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED, _KRAKEN_LEDGER_BURNIN_DAYS_WARNED
     if not KRAKEN_CACHE["enabled"]:
         return
     if _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID and not _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED:
@@ -2934,6 +2948,13 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             "Invalid/out-of-range KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS '%s'; using %s",
             _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS_RAW,
             KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+        )
+    if _KRAKEN_LEDGER_BURNIN_DAYS_INVALID and not _KRAKEN_LEDGER_BURNIN_DAYS_WARNED:
+        _KRAKEN_LEDGER_BURNIN_DAYS_WARNED = True
+        logger.warning(
+            "Invalid/out-of-range KRAKEN_LEDGER_BURNIN_DAYS '%s'; using %s",
+            _KRAKEN_LEDGER_BURNIN_DAYS_RAW,
+            KRAKEN_LEDGER_BURNIN_DAYS,
         )
 
     should_refresh_panels = False
@@ -3102,21 +3123,23 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                 if unlock_rows:
                     first = unlock_rows[0]
                     logger.info(
-                        "Kraken ledger hold estimate refreshed: events=%s active_rows=%s hold_total=%s next=%s +%s offset_hours=%s pos_filter=%s types=%s",
+                        "Kraken ledger hold estimate refreshed: events=%s active_rows=%s hold_total=%s next=%s +%s offset_hours=%s burnin_days=%s pos_filter=%s types=%s",
                         len(ledger_events),
                         len(unlock_rows),
                         _format_kraken_amount_4(hold_total_ledger_usdt),
                         first.get("unlock_at_iso"),
                         _format_kraken_amount_4(_kraken_decimal_or_none(first.get("amount_usdt")) or Decimal("0")),
                         KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+                        KRAKEN_LEDGER_BURNIN_DAYS,
                         filter_summary,
                         type_summary,
                     )
                 else:
                     logger.info(
-                        "Kraken ledger hold estimate refreshed: events=%s active_rows=0 hold_total=0.0000 offset_hours=%s pos_filter=%s types=%s",
+                        "Kraken ledger hold estimate refreshed: events=%s active_rows=0 hold_total=0.0000 offset_hours=%s burnin_days=%s pos_filter=%s types=%s",
                         len(ledger_events),
                         KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+                        KRAKEN_LEDGER_BURNIN_DAYS,
                         filter_summary,
                         type_summary,
                     )
@@ -3153,7 +3176,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             delta_dep_vs_api = deposit_est_for_log - api_tradable_for_delta
 
         logger.info(
-            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s ledger_offset=%s pos_filter=%s",
+            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s ledger_offset=%s burnin_days=%s pos_filter=%s",
             KRAKEN_TRADABLE_MODEL,
             _fmt_est_log(active_est_tradable),
             _fmt_est_log(deposit_est_for_log),
@@ -3163,6 +3186,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             _fmt_est_log(delta_dep_vs_led),
             _fmt_est_log(delta_dep_vs_api),
             KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+            KRAKEN_LEDGER_BURNIN_DAYS,
             ",".join(sorted(KRAKEN_LEDGER_POSITIVE_TYPES_SET)) if KRAKEN_LEDGER_POSITIVE_TYPES_SET else "*",
         )
 
