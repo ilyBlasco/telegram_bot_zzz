@@ -4172,7 +4172,13 @@ def build_panel_text(total_cents: int) -> str:
     if isinstance(available_usdt, Decimal):
         release_lines.append(f"<i>Release disponible ahora: <code>${_format_money_decimal_2(available_usdt)}</code></i>")
         if readiness.get("is_ready"):
-            release_lines.append("<i>Listo para liberar TOTAL</i>")
+            required_usdt = readiness.get("required_usdt")
+            if isinstance(required_usdt, Decimal):
+                release_lines.append(
+                    f"<i>Listo para liberar TOTAL: <code>${_format_money_decimal_2(required_usdt)}</code></i>"
+                )
+            else:
+                release_lines.append("<i>Listo para liberar TOTAL</i>")
         else:
             missing_usdt = readiness.get("missing_usdt")
             if isinstance(missing_usdt, Decimal) and missing_usdt > 0:
