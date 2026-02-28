@@ -49,6 +49,10 @@ KRAKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("KRAKEN_TIMEOUT_SECONDS", "10")))
 KRAKEN_ASSET = (os.getenv("KRAKEN_ASSET", "USDT").strip().upper() or "USDT")
 KRAKEN_HOLD_DAYS = max(1, int(os.getenv("KRAKEN_HOLD_DAYS", "8")))
 KRAKEN_LEDGER_MAX_PAGES = max(1, int(os.getenv("KRAKEN_LEDGER_MAX_PAGES", "10")))
+KRAKEN_TRADABLE_MODEL = (os.getenv("KRAKEN_TRADABLE_MODEL", "deposit_usd").strip().lower() or "deposit_usd")
+if KRAKEN_TRADABLE_MODEL not in {"deposit_usd", "ledger_usdt"}:
+    KRAKEN_TRADABLE_MODEL = "deposit_usd"
+KRAKEN_LEDGER_SHADOW_ENABLED = (os.getenv("KRAKEN_LEDGER_SHADOW_ENABLED", "1").strip() != "0")
 _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE = "ui" if (KRAKEN_API_KEY and KRAKEN_API_SECRET) else "off"
 KRAKEN_DEPOSIT_ESTIMATOR_MODE = (
     os.getenv("KRAKEN_DEPOSIT_ESTIMATOR_MODE", _KRAKEN_DEPOSIT_ESTIMATOR_DEFAULT_MODE).strip().lower()
@@ -200,6 +204,12 @@ KRAKEN_CACHE: dict = {
     "last_success_at_deposit_status": None,
     "last_error_deposit_status": None,
     "countdown_refresh_bucket": None,
+    "tradable_est_deposit_usd": None,  # Decimal | None
+    "tradable_est_ledger_usdt": None,  # Decimal | None
+    "hold_total_deposit_usd": None,  # Decimal | None
+    "hold_total_ledger_usdt": None,  # Decimal | None
+    "estimator_delta_usdt": None,  # Decimal | None (active estimator vs API tradable)
+    "estimator_source_active": KRAKEN_TRADABLE_MODEL,
 }
 
 GMAIL_SENDER_LIST_PAGE_SIZE = 10
@@ -2031,7 +2041,7 @@ def _format_money_decimal_2(value: Decimal) -> str:
 def _resolve_release_effective_tradable_usdt(snapshot: dict | None = None) -> tuple[Decimal | None, str]:
     snap = snapshot or _kraken_state_snapshot()
     api_tradable = _kraken_decimal_or_none(snap.get("api_tradable_usdt"))
-    hold_est_tradable = _compute_hold_estimate_tradable_usdt(snap, now_utc())
+    hold_est_tradable = _resolve_active_estimated_tradable(snap, now_utc())
     source = RELEASE_TRADABLE_SOURCE
 
     resolved: Decimal | None = None
@@ -2210,7 +2220,7 @@ def _collect_active_kraken_unlock_rows(
 
 
 def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | None = None) -> Decimal | None:
-    if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
+    if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "off":
         return None
     if render_now is None:
         render_now = now_utc()
@@ -2226,6 +2236,45 @@ def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | 
     return est_tradable
 
 
+def _compute_ledger_estimate_tradable_usdt(snapshot: dict) -> Decimal | None:
+    balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
+    if balance is None:
+        return None
+
+    hold_total = _kraken_decimal_or_none(snapshot.get("hold_total_ledger_usdt"))
+    if hold_total is None:
+        rows = snapshot.get("unlock_rows") or []
+        if not rows:
+            return None
+        hold_total = sum(
+            (
+                _kraken_decimal_or_none(row.get("amount_usdt")) or Decimal("0")
+                for row in rows
+            ),
+            Decimal("0"),
+        )
+
+    est_tradable = balance - hold_total
+    if est_tradable < 0:
+        est_tradable = Decimal("0")
+    return est_tradable
+
+
+def _resolve_active_estimated_tradable(snapshot: dict | None = None, render_now: datetime | None = None) -> Decimal | None:
+    snap = snapshot or _kraken_state_snapshot()
+    model = KRAKEN_TRADABLE_MODEL
+    if model == "ledger_usdt":
+        ledger_est = _kraken_decimal_or_none(snap.get("tradable_est_ledger_usdt"))
+        if ledger_est is not None:
+            return ledger_est
+        return _compute_ledger_estimate_tradable_usdt(snap)
+
+    deposit_est = _kraken_decimal_or_none(snap.get("tradable_est_deposit_usd"))
+    if deposit_est is not None:
+        return deposit_est
+    return _compute_hold_estimate_tradable_usdt(snap, render_now)
+
+
 def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | None = None) -> str:
     if render_now is None:
         render_now = now_utc()
@@ -2234,7 +2283,7 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
-    lines = [f"<b>\U0001F7E3 KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"]
+    lines = [f"<b>\U0001F7E3 KRAKEN BALANCE:</b> <code>{balance_str}</code> (USDT){stale_suffix}"]
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -2252,9 +2301,9 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
             f"{_format_countdown_short(render_now, unlock_at)} &#183; {_format_kraken_display_time_short(unlock_at)}</i>"
         )
 
-    est_tradable = _compute_hold_estimate_tradable_usdt(snapshot, render_now)
+    est_tradable = _resolve_active_estimated_tradable(snapshot, render_now)
     if est_tradable is not None:
-        lines.append(f"<b>\U0001F7E3 KRAKEN TRADABLE [EST]: {_format_kraken_amount_4(est_tradable)} (USDT)</b>")
+        lines.append(f"<b>\U0001F7E3 KRAKEN TRADABLE [EST]:</b> <code>{_format_kraken_amount_4(est_tradable)}</code> (USDT)")
 
     if not row_lines:
         return "\n".join(lines)
@@ -2278,7 +2327,7 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
-    lines = [f"<b>\U0001F7E3 KRAKEN BALANCE:</b> {balance_str} (USDT){stale_suffix}"]
+    lines = [f"<b>\U0001F7E3 KRAKEN BALANCE:</b> <code>{balance_str}</code> (USDT){stale_suffix}"]
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -2287,9 +2336,9 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     if deposit_status not in {"ok", "stale"}:
         return "\n".join(lines)
 
-    est_tradable = _compute_hold_estimate_tradable_usdt(snapshot, render_now)
+    est_tradable = _resolve_active_estimated_tradable(snapshot, render_now)
     if est_tradable is not None:
-        lines.append(f"<b>\U0001F7E3 KRAKEN TRADABLE [EST]:</b> {_format_kraken_amount_4(est_tradable)} (USDT)")
+        lines.append(f"<b>\U0001F7E3 KRAKEN TRADABLE [EST]:</b> <code>{_format_kraken_amount_4(est_tradable)}</code> (USDT)")
 
     if not active_rows:
         return "\n".join(lines)
@@ -2879,11 +2928,6 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                 _format_kraken_amount_4(locked_usdt),
             )
 
-        # Hotfix mode: disable unsupported hold/unlock estimation to avoid misleading values.
-        KRAKEN_CACHE["ledger_status"] = "disabled"
-        KRAKEN_CACHE["unlock_rows"] = []
-        KRAKEN_CACHE["last_error_ledger"] = None
-
         if KRAKEN_DEPOSIT_ESTIMATOR_MODE == "off":
             KRAKEN_CACHE["deposit_estimator_status"] = "disabled"
             KRAKEN_CACHE["deposit_hold_rows_usd"] = []
@@ -2955,6 +2999,96 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                         KRAKEN_DEPOSIT_TIME_ANCHOR,
                         ", ".join(f"{k}={source_counts[k]}" for k in sorted(source_counts.keys())),
                     )
+
+        # Keep explicit cache fields for model diagnostics and UI/release consumption.
+        deposit_hold_total_usd = _kraken_decimal_or_none(KRAKEN_CACHE.get("deposit_hold_total_usd"))
+        KRAKEN_CACHE["hold_total_deposit_usd"] = deposit_hold_total_usd
+        KRAKEN_CACHE["tradable_est_deposit_usd"] = _compute_hold_estimate_tradable_usdt(KRAKEN_CACHE, refresh_now)
+
+        ledger_shadow_active = KRAKEN_LEDGER_SHADOW_ENABLED or KRAKEN_TRADABLE_MODEL == "ledger_usdt"
+        if not ledger_shadow_active:
+            KRAKEN_CACHE["ledger_status"] = "disabled"
+            KRAKEN_CACHE["unlock_rows"] = []
+            KRAKEN_CACHE["hold_total_ledger_usdt"] = None
+            KRAKEN_CACHE["tradable_est_ledger_usdt"] = None
+            KRAKEN_CACHE["last_error_ledger"] = None
+        else:
+            try:
+                ledger_events, hit_cap = await asyncio.to_thread(
+                    _fetch_usdt_ledger_events_with_pagination,
+                    refresh_now,
+                )
+                unlock_rows = _estimate_unlock_rows_fifo(ledger_events, refresh_now)
+                hold_total_ledger_usdt = sum(
+                    (
+                        _kraken_decimal_or_none(row.get("amount_usdt")) or Decimal("0")
+                        for row in unlock_rows
+                    ),
+                    Decimal("0"),
+                )
+            except Exception as e:
+                had_success = KRAKEN_CACHE.get("last_success_at_ledger") is not None
+                KRAKEN_CACHE["ledger_status"] = "stale" if had_success else "error"
+                KRAKEN_CACHE["last_error_ledger"] = str(e)[:200]
+                logger.warning("Kraken ledger hold estimate refresh failed: %s", KRAKEN_CACHE["last_error_ledger"])
+                if not had_success:
+                    KRAKEN_CACHE["unlock_rows"] = []
+                    KRAKEN_CACHE["hold_total_ledger_usdt"] = None
+                    KRAKEN_CACHE["tradable_est_ledger_usdt"] = None
+            else:
+                KRAKEN_CACHE["ledger_status"] = "ok"
+                KRAKEN_CACHE["unlock_rows"] = unlock_rows
+                KRAKEN_CACHE["hold_total_ledger_usdt"] = hold_total_ledger_usdt
+                KRAKEN_CACHE["last_success_at_ledger"] = now_utc_iso()
+                KRAKEN_CACHE["last_error_ledger"] = None
+                if hit_cap:
+                    logger.warning(
+                        "Kraken ledger pagination cap hit (%s pages); hold estimate may be incomplete",
+                        KRAKEN_LEDGER_MAX_PAGES,
+                    )
+
+        KRAKEN_CACHE["tradable_est_ledger_usdt"] = _compute_ledger_estimate_tradable_usdt(KRAKEN_CACHE)
+        KRAKEN_CACHE["estimator_source_active"] = KRAKEN_TRADABLE_MODEL
+
+        active_est_tradable = _resolve_active_estimated_tradable(KRAKEN_CACHE, refresh_now)
+        api_tradable_for_delta = _kraken_decimal_or_none(KRAKEN_CACHE.get("api_tradable_usdt"))
+        if active_est_tradable is not None:
+            KRAKEN_CACHE["tradable_usdt"] = active_est_tradable
+            balance_for_lock = _kraken_decimal_or_none(KRAKEN_CACHE.get("balance_usdt"))
+            if balance_for_lock is not None:
+                locked_est = balance_for_lock - active_est_tradable
+                if locked_est < 0:
+                    locked_est = Decimal("0")
+                KRAKEN_CACHE["locked_usdt"] = locked_est
+
+        if active_est_tradable is not None and api_tradable_for_delta is not None:
+            KRAKEN_CACHE["estimator_delta_usdt"] = active_est_tradable - api_tradable_for_delta
+        else:
+            KRAKEN_CACHE["estimator_delta_usdt"] = None
+
+        def _fmt_est_log(value: Decimal | None) -> str:
+            return "--" if value is None else _format_kraken_amount_4(value)
+
+        deposit_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_deposit_usd"))
+        ledger_est_for_log = _kraken_decimal_or_none(KRAKEN_CACHE.get("tradable_est_ledger_usdt"))
+        delta_dep_vs_led = None
+        if deposit_est_for_log is not None and ledger_est_for_log is not None:
+            delta_dep_vs_led = deposit_est_for_log - ledger_est_for_log
+        delta_dep_vs_api = None
+        if deposit_est_for_log is not None and api_tradable_for_delta is not None:
+            delta_dep_vs_api = deposit_est_for_log - api_tradable_for_delta
+
+        logger.info(
+            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s",
+            KRAKEN_TRADABLE_MODEL,
+            _fmt_est_log(active_est_tradable),
+            _fmt_est_log(deposit_est_for_log),
+            _fmt_est_log(ledger_est_for_log),
+            _fmt_est_log(api_tradable_for_delta),
+            _fmt_est_log(_kraken_decimal_or_none(KRAKEN_CACHE.get("estimator_delta_usdt"))),
+            _fmt_est_log(delta_dep_vs_led),
+            _fmt_est_log(delta_dep_vs_api),
+        )
 
         after_snapshot = _kraken_state_snapshot()
         after_block = _format_kraken_dashboard_block(after_snapshot, render_now=refresh_now)
