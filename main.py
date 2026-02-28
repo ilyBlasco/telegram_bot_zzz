@@ -2208,10 +2208,13 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
 
     balance_status = str(snapshot.get("balance_status") or "")
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
+    api_tradable = _kraken_decimal_or_none(snapshot.get("api_tradable_usdt"))
 
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
     lines = [f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"]
+    if api_tradable is not None:
+        lines.append(f"<b>KRAKEN TRADABLE [API]: {_format_kraken_amount_4(api_tradable)} (USDT)</b>")
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -2253,9 +2256,12 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
 
     balance_status = str(snapshot.get("balance_status") or "")
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
+    api_tradable = _kraken_decimal_or_none(snapshot.get("api_tradable_usdt"))
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
     lines = [f"<b>KRAKEN BALANCE:</b> {balance_str} (USDT){stale_suffix}"]
+    if api_tradable is not None:
+        lines.append(f"<b>KRAKEN TRADABLE [API]:</b> {_format_kraken_amount_4(api_tradable)} (USDT)")
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
