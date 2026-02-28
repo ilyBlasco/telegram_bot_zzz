@@ -2925,6 +2925,39 @@ def _estimate_unlock_rows_fifo(events: list[dict], now_dt: datetime) -> list[dic
     return out_rows
 
 
+def _estimate_unlock_rows_timelock(events: list[dict], now_dt: datetime) -> tuple[list[dict], int]:
+    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS, hours=KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS)
+    rows_by_minute: dict[str, dict] = {}
+    positive_events_used = 0
+
+    for ev in events:
+        ev_time = ev.get("time")
+        amount = _kraken_decimal_or_none(ev.get("amount"))
+        if not isinstance(ev_time, datetime) or amount is None or amount <= 0:
+            continue
+
+        unlock_at = ev_time + hold_delta
+        if unlock_at <= now_dt:
+            continue
+
+        positive_events_used += 1
+        minute_dt = unlock_at.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        minute_key = dt_to_iso(minute_dt)
+        row = rows_by_minute.get(minute_key)
+        if row is None:
+            row = {"unlock_at": minute_dt, "amount_usdt": Decimal("0")}
+            rows_by_minute[minute_key] = row
+        row["amount_usdt"] += amount
+
+    rows = sorted(rows_by_minute.values(), key=lambda r: r["unlock_at"])
+    out_rows = [
+        {"unlock_at_iso": dt_to_iso(r["unlock_at"]), "amount_usdt": r["amount_usdt"]}
+        for r in rows
+        if r["amount_usdt"] > 0
+    ]
+    return out_rows, positive_events_used
+
+
 async def refresh_kraken_cache_once(app: Application) -> None:
     global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED, _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED, _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED, _KRAKEN_LEDGER_BURNIN_DAYS_WARNED
     if not KRAKEN_CACHE["enabled"]:
@@ -3082,7 +3115,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                     _fetch_usdt_ledger_events_with_pagination,
                     refresh_now,
                 )
-                unlock_rows = _estimate_unlock_rows_fifo(ledger_events, refresh_now)
+                unlock_rows, positive_events_used = _estimate_unlock_rows_timelock(ledger_events, refresh_now)
                 hold_total_ledger_usdt = sum(
                     (
                         _kraken_decimal_or_none(row.get("amount_usdt")) or Decimal("0")
@@ -3123,8 +3156,9 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                 if unlock_rows:
                     first = unlock_rows[0]
                     logger.info(
-                        "Kraken ledger hold estimate refreshed: events=%s active_rows=%s hold_total=%s next=%s +%s offset_hours=%s burnin_days=%s pos_filter=%s types=%s",
+                        "Kraken ledger hold estimate refreshed: strategy=timelock events=%s positive_events_used=%s active_rows=%s hold_total=%s next=%s +%s offset_hours=%s burnin_days=%s pos_filter=%s types=%s",
                         len(ledger_events),
+                        positive_events_used,
                         len(unlock_rows),
                         _format_kraken_amount_4(hold_total_ledger_usdt),
                         first.get("unlock_at_iso"),
@@ -3136,8 +3170,9 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                     )
                 else:
                     logger.info(
-                        "Kraken ledger hold estimate refreshed: events=%s active_rows=0 hold_total=0.0000 offset_hours=%s burnin_days=%s pos_filter=%s types=%s",
+                        "Kraken ledger hold estimate refreshed: strategy=timelock events=%s positive_events_used=%s active_rows=0 hold_total=0.0000 offset_hours=%s burnin_days=%s pos_filter=%s types=%s",
                         len(ledger_events),
+                        positive_events_used,
                         KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
                         KRAKEN_LEDGER_BURNIN_DAYS,
                         filter_summary,
