@@ -2263,7 +2263,7 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
     if deposit_status == "stale":
         lines.append("<i>&#9888; Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
 
-    lines.append(f"<i>KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
+    lines.append(f"<i>\U0001F991 KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
     lines.append("")
     lines.append("<i>UNLOCKS [EST USD]:</i>")
     lines.extend(row_lines)
@@ -2299,13 +2299,13 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
         lines.append("<i>&#9888; Kraken deposit hold estimate refresh failed, showing cached estimate</i>")
 
     lines.append("")
-    lines.append(f"<i>KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
+    lines.append(f"<i>\U0001F991 KRAKEN HOLDS [EST USD]: {_format_usd_est_amount_int(total_usd)}</i>")
 
     next_row = active_rows[0]
     next_amount = next_row["amount_usd"]
     next_unlock_at = next_row["unlock_at"]
     lines.append(
-        f"<i>\U0001F991 NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
+        f"<i>\NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
         f"{_format_countdown_short(render_now, next_unlock_at)}</i>"
     )
     tail = _format_kraken_display_time_short(next_unlock_at)
