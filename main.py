@@ -2234,7 +2234,7 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
-    lines = [f"<b>KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"]
+    lines = [f"<b>\U0001F7E3 KRAKEN BALANCE: {balance_str} (USDT){stale_suffix}</b>"]
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -2254,7 +2254,7 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
 
     est_tradable = _compute_hold_estimate_tradable_usdt(snapshot, render_now)
     if est_tradable is not None:
-        lines.append(f"<b>KRAKEN TRADABLE [EST]: {_format_kraken_amount_4(est_tradable)} (USDT)</b>")
+        lines.append(f"<b>\U0001F7E3 KRAKEN TRADABLE [EST]: {_format_kraken_amount_4(est_tradable)} (USDT)</b>")
 
     if not row_lines:
         return "\n".join(lines)
@@ -2278,7 +2278,7 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
     balance_str = _format_kraken_amount_4(balance) if balance is not None else "--"
     stale_suffix = " [STALE]" if (balance is not None and balance_status == "stale") else ""
-    lines = [f"<b>KRAKEN BALANCE:</b> {balance_str} (USDT){stale_suffix}"]
+    lines = [f"<b>\U0001F7E3 KRAKEN BALANCE:</b> {balance_str} (USDT){stale_suffix}"]
 
     if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
         return "\n".join(lines)
@@ -2289,7 +2289,7 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
 
     est_tradable = _compute_hold_estimate_tradable_usdt(snapshot, render_now)
     if est_tradable is not None:
-        lines.append(f"<b>KRAKEN TRADABLE [EST]:</b> {_format_kraken_amount_4(est_tradable)} (USDT)")
+        lines.append(f"<b>\U0001F7E3 KRAKEN TRADABLE [EST]:</b> {_format_kraken_amount_4(est_tradable)} (USDT)")
 
     if not active_rows:
         return "\n".join(lines)
@@ -2305,7 +2305,7 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     next_amount = next_row["amount_usd"]
     next_unlock_at = next_row["unlock_at"]
     lines.append(
-        f"<i>NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
+        f"<i>\U0001F991 NEXT UNLOCK [EST USD]: {_format_usd_row_amount(next_amount)} &#183; "
         f"{_format_countdown_short(render_now, next_unlock_at)}</i>"
     )
     tail = _format_kraken_display_time_short(next_unlock_at)
@@ -3691,7 +3691,7 @@ def build_panel_text(total_cents: int) -> str:
             )
 
     return (
-        f"{kraken_block}\n"
+        f"{kraken_block}\n\n"
         f"{release_readiness_block}\n\n"
         "光 ═════════════ 光\n\n"
         f"💰 <b>TOTAL</b> :: <code>${cents_to_money_str(total_cents)}</code>\n"
@@ -3717,7 +3717,7 @@ def build_panel_keyboard(viewer_id: int | None = None) -> InlineKeyboardMarkup:
 
     rows.append(
         [
-            InlineKeyboardButton("📊 Kraken", callback_data="krakenview"),
+            InlineKeyboardButton("\U0001F991 Kraken", callback_data="krakenview"),
             InlineKeyboardButton("📇 Senders", callback_data="senders"),
         ]
     )
