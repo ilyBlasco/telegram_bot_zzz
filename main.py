@@ -76,6 +76,31 @@ if KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS < -48:
 elif KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS > 48:
     KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS = 48
     _KRAKEN_HOLD_ESTIMATE_OFFSET_INVALID = True
+_KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS_RAW = (
+    os.getenv("KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS", str(KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS)).strip()
+    or str(KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS)
+)
+_KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_INVALID = False
+try:
+    KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS = int(_KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS_RAW)
+except Exception:
+    KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS = KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS
+    _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_INVALID = True
+if KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS < -48:
+    KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS = -48
+    _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_INVALID = True
+elif KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS > 48:
+    KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS = 48
+    _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_INVALID = True
+_KRAKEN_LEDGER_POSITIVE_TYPES_RAW = (os.getenv("KRAKEN_LEDGER_POSITIVE_TYPES", "deposit").strip().lower() or "deposit")
+if _KRAKEN_LEDGER_POSITIVE_TYPES_RAW in {"*", "all"}:
+    KRAKEN_LEDGER_POSITIVE_TYPES_SET: set[str] = set()
+else:
+    KRAKEN_LEDGER_POSITIVE_TYPES_SET = {
+        part.strip().lower()
+        for part in _KRAKEN_LEDGER_POSITIVE_TYPES_RAW.replace(";", ",").split(",")
+        if part.strip()
+    }
 KRAKEN_DISPLAY_TZ = os.getenv("KRAKEN_DISPLAY_TZ", "America/Chicago").strip() or "America/Chicago"
 _KRAKEN_DEPOSIT_TIME_ANCHOR_ALLOWED = {"auto", "processed", "completed", "accepted", "time", "request", "created"}
 _KRAKEN_DEPOSIT_TIME_ANCHOR_RAW = (os.getenv("KRAKEN_DEPOSIT_TIME_ANCHOR", "auto").strip().lower() or "auto")
@@ -166,6 +191,7 @@ _KRAKEN_DISPLAY_TZINFO = None
 _KRAKEN_DISPLAY_TZ_WARNED = False
 _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED = False
 _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED = False
+_KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED = False
 _GMAIL_ZELLE_ACTOR_USER_ID_WARNED = False
 _GMAIL_ZELLE_MODE_WARNED = False
 _GMAIL_ZELLE_LABEL_ID_CACHE: str | None = None
@@ -2751,11 +2777,19 @@ def _extract_usdt_ledger_events(payload: dict) -> list[dict]:
         if not _kraken_asset_matches_target(asset_upper):
             continue
 
+        event_type = str(item.get("type") or "").strip().lower()
+        event_subtype = str(item.get("subtype") or "").strip().lower()
+
         try:
             amount = Decimal(str(item.get("amount")))
             ev_time = datetime.fromtimestamp(float(item.get("time")), tz=timezone.utc)
         except Exception:
             continue
+
+        if amount > 0 and KRAKEN_LEDGER_POSITIVE_TYPES_SET:
+            # Positive entries outside the configured allowlist tend to overstate held USDT.
+            if event_type not in KRAKEN_LEDGER_POSITIVE_TYPES_SET:
+                continue
 
         events.append(
             {
@@ -2764,6 +2798,8 @@ def _extract_usdt_ledger_events(payload: dict) -> list[dict]:
                 "asset": asset_upper,
                 "time": ev_time,
                 "amount": amount,
+                "type": event_type,
+                "subtype": event_subtype,
             }
         )
 
@@ -2818,7 +2854,7 @@ def _fetch_usdt_ledger_events_with_pagination(fetch_now: datetime) -> tuple[list
 
 
 def _estimate_unlock_rows_fifo(events: list[dict], now_dt: datetime) -> list[dict]:
-    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS)
+    hold_delta = timedelta(days=KRAKEN_HOLD_DAYS, hours=KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS)
     lots: list[dict] = []
 
     for ev in events:
@@ -2876,7 +2912,7 @@ def _estimate_unlock_rows_fifo(events: list[dict], now_dt: datetime) -> list[dic
 
 
 async def refresh_kraken_cache_once(app: Application) -> None:
-    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED, _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED
+    global _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED, _KRAKEN_HOLD_ESTIMATE_OFFSET_WARNED, _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED
     if not KRAKEN_CACHE["enabled"]:
         return
     if _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID and not _KRAKEN_DEPOSIT_TIME_ANCHOR_INVALID_WARNED:
@@ -2891,6 +2927,13 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             "Invalid/out-of-range KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS '%s'; using %s",
             _KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS_RAW,
             KRAKEN_HOLD_ESTIMATE_OFFSET_HOURS,
+        )
+    if _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_INVALID and not _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED:
+        _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_WARNED = True
+        logger.warning(
+            "Invalid/out-of-range KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS '%s'; using %s",
+            _KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS_RAW,
+            KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
         )
 
     should_refresh_panels = False
@@ -3046,6 +3089,37 @@ async def refresh_kraken_cache_once(app: Application) -> None:
                         "Kraken ledger pagination cap hit (%s pages); hold estimate may be incomplete",
                         KRAKEN_LEDGER_MAX_PAGES,
                     )
+                type_counts: dict[str, int] = {}
+                for ev in ledger_events:
+                    t = str(ev.get("type") or "unknown")
+                    type_counts[t] = type_counts.get(t, 0) + 1
+                type_summary = ", ".join(f"{k}={type_counts[k]}" for k in sorted(type_counts.keys())) if type_counts else "none"
+                filter_summary = (
+                    ",".join(sorted(KRAKEN_LEDGER_POSITIVE_TYPES_SET))
+                    if KRAKEN_LEDGER_POSITIVE_TYPES_SET
+                    else "*"
+                )
+                if unlock_rows:
+                    first = unlock_rows[0]
+                    logger.info(
+                        "Kraken ledger hold estimate refreshed: events=%s active_rows=%s hold_total=%s next=%s +%s offset_hours=%s pos_filter=%s types=%s",
+                        len(ledger_events),
+                        len(unlock_rows),
+                        _format_kraken_amount_4(hold_total_ledger_usdt),
+                        first.get("unlock_at_iso"),
+                        _format_kraken_amount_4(_kraken_decimal_or_none(first.get("amount_usdt")) or Decimal("0")),
+                        KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+                        filter_summary,
+                        type_summary,
+                    )
+                else:
+                    logger.info(
+                        "Kraken ledger hold estimate refreshed: events=%s active_rows=0 hold_total=0.0000 offset_hours=%s pos_filter=%s types=%s",
+                        len(ledger_events),
+                        KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+                        filter_summary,
+                        type_summary,
+                    )
 
         KRAKEN_CACHE["tradable_est_ledger_usdt"] = _compute_ledger_estimate_tradable_usdt(KRAKEN_CACHE)
         KRAKEN_CACHE["estimator_source_active"] = KRAKEN_TRADABLE_MODEL
@@ -3079,7 +3153,7 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             delta_dep_vs_api = deposit_est_for_log - api_tradable_for_delta
 
         logger.info(
-            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s",
+            "Kraken tradable estimate compare model=%s active=%s deposit=%s ledger=%s api=%s d_active_vs_api=%s d_deposit_vs_ledger=%s d_deposit_vs_api=%s ledger_offset=%s pos_filter=%s",
             KRAKEN_TRADABLE_MODEL,
             _fmt_est_log(active_est_tradable),
             _fmt_est_log(deposit_est_for_log),
@@ -3088,6 +3162,8 @@ async def refresh_kraken_cache_once(app: Application) -> None:
             _fmt_est_log(_kraken_decimal_or_none(KRAKEN_CACHE.get("estimator_delta_usdt"))),
             _fmt_est_log(delta_dep_vs_led),
             _fmt_est_log(delta_dep_vs_api),
+            KRAKEN_LEDGER_HOLD_ESTIMATE_OFFSET_HOURS,
+            ",".join(sorted(KRAKEN_LEDGER_POSITIVE_TYPES_SET)) if KRAKEN_LEDGER_POSITIVE_TYPES_SET else "*",
         )
 
         after_snapshot = _kraken_state_snapshot()
