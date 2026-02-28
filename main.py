@@ -199,6 +199,7 @@ GMAIL_ZELLE_BASK_EXPECTED_TO_CONTAINS = (os.getenv("GMAIL_ZELLE_BASK_EXPECTED_TO
 GMAIL_ZELLE_BASK_PARSER_STRICT = (os.getenv("GMAIL_ZELLE_BASK_PARSER_STRICT", "1").strip() != "0")
 GMAIL_ZELLE_PAYER_KEY_ALLOWLIST_RAW = (os.getenv("GMAIL_ZELLE_PAYER_KEY_ALLOWLIST", "").strip() or "")
 GMAIL_ZELLE_PAYER_KEY_BLOCKLIST_RAW = (os.getenv("GMAIL_ZELLE_PAYER_KEY_BLOCKLIST", "").strip() or "")
+TRACKER_BRAND_NAME = (os.getenv("TRACKER_BRAND_NAME", "Yozu Tracker").strip() or "Yozu Tracker")
 
 # Delete notifications + small bot messages after N seconds (prod: 10800 for 3h)
 NOTIFY_DELETE_SECONDS = int(os.getenv("NOTIFY_DELETE_SECONDS", "10"))
@@ -3530,6 +3531,10 @@ def _html_escape(value: str | None) -> str:
     return html_lib.escape(str(value or ""), quote=False)
 
 
+def _tracker_brand_title_html() -> str:
+    return f"<b>{_html_escape(TRACKER_BRAND_NAME)}</b>"
+
+
 def _gmail_decode_b64url_text(data: str | None) -> str:
     if not data:
         return ""
@@ -4700,7 +4705,7 @@ async def _undo_last_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     last = get_last_movement()
     if not last:
-        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer lol.")
+        await notify(context, f"{_tracker_brand_title_html()}\nNo hay nada que deshacer lol.")
         return
 
     last_kind = last["kind"]
@@ -4731,7 +4736,7 @@ async def _undo_last_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify(
             context,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 "<b>⏪ Control + Z</b>\n"
                 f"Se deshizo: <code>${cents_to_money_str(last_amount)}</code>\n"
                 f"Total: <code>${cents_to_money_str(new_total)}</code>"
@@ -4754,7 +4759,7 @@ async def _undo_last_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify(
             context,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 "<b>⏪ Control + Z</b>\n"
                 "Se deshizo un <b>Release</b>.\n"
                 f"Total restaurado: <code>${cents_to_money_str(restored_total)}</code>"
@@ -4764,7 +4769,7 @@ async def _undo_last_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_all_panels(context)
         return
 
-    await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
+    await notify(context, f"{_tracker_brand_title_html()}\nNo se pudo deshacer (tipo desconocido).")
 
 
 # Transactional undo implementation (overrides legacy helper above).
@@ -4775,7 +4780,7 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = undo_last_movement_tx()
 
     if not result:
-        await notify(context, "<b>Yozu Tracker</b>\nNo hay nada que deshacer lol.")
+        await notify(context, f"{_tracker_brand_title_html()}\nNo hay nada que deshacer lol.")
         return
 
     if result["kind"] == "add":
@@ -4795,7 +4800,7 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify(
             context,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 "<b>⏪ Control + Z</b>\n"
                 f"Se deshizo: <code>${cents_to_money_str(int(result['amount_cents']))}</code>\n"
                 f"Total: <code>${cents_to_money_str(int(result['new_total_cents']))}</code>"
@@ -4808,7 +4813,7 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify(
             context,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 "<b>⏪ Control + Z</b>\n"
                 "Se deshizo un <b>Release</b>.\n"
                 f"Total restaurado: <code>${cents_to_money_str(int(result['restored_total_cents']))}</code>"
@@ -4821,7 +4826,7 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify(
             context,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 "<b>⏪ Control + Z</b>\n"
                 "Se deshizo una <b>reversa</b>.\n"
                 f"Total: <code>${cents_to_money_str(int(result['new_total_cents']))}</code>"
@@ -4830,7 +4835,7 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_all_panels(context)
         return
 
-    await notify(context, "<b>Yozu Tracker</b>\nNo se pudo deshacer (tipo desconocido).")
+    await notify(context, f"{_tracker_brand_title_html()}\nNo se pudo deshacer (tipo desconocido).")
 
 
 # =========================
@@ -4920,7 +4925,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify(
             context,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 f"Se agregó: <code>${cents_to_money_str(add_cents)}</code>\n"
                 f"Total: <code>${cents_to_money_str(total_cents)}</code>"
             ),
@@ -5258,7 +5263,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_for_app(
             context.application,
             (
-                "<b>Yozu Tracker</b>\n"
+                f"{_tracker_brand_title_html()}\n"
                 "<b>解Release除</b>\n"
                 f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
                 f"Fee: <code>${cents_to_money_str(fee_cents)}</code>\n"
@@ -5445,7 +5450,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify(
         context,
         (
-            "<b>Yozu Tracker</b>\n"
+            f"{_tracker_brand_title_html()}\n"
             f"Se agregó: <code>${cents_to_money_str(add_cents)}</code>\n"
             f"Total: <code>${cents_to_money_str(total_cents)}</code>"
         ),
