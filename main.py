@@ -155,6 +155,7 @@ logger = logging.getLogger(__name__)
 # Serialize state-changing DB operations inside this single process.
 STATE_LOCK = asyncio.Lock()
 KRAKEN_REFRESH_LOCK = asyncio.Lock()
+PANEL_RENDER_LOCKS: dict[int, asyncio.Lock] = {}
 KRAKEN_REFRESH_TASK: asyncio.Task | None = None
 GMAIL_ZELLE_TASK: asyncio.Task | None = None
 _KRAKEN_DISPLAY_TZINFO = None
@@ -2030,18 +2031,19 @@ def _format_money_decimal_2(value: Decimal) -> str:
 def _resolve_release_effective_tradable_usdt(snapshot: dict | None = None) -> tuple[Decimal | None, str]:
     snap = snapshot or _kraken_state_snapshot()
     api_tradable = _kraken_decimal_or_none(snap.get("api_tradable_usdt"))
-    est_tradable = _kraken_decimal_or_none(snap.get("tradable_usdt"))
+    hold_est_tradable = _compute_hold_estimate_tradable_usdt(snap, now_utc())
     source = RELEASE_TRADABLE_SOURCE
 
     resolved: Decimal | None = None
     if source == "api_only":
         resolved = api_tradable
     elif source == "est_only":
-        resolved = est_tradable
+        resolved = hold_est_tradable
     else:
-        candidates = [v for v in (api_tradable, est_tradable) if v is not None]
-        if candidates:
-            resolved = min(candidates)
+        # Conservative mode requires hold-estimate availability.
+        # If API tradable is available too, use the lower of both.
+        if hold_est_tradable is not None:
+            resolved = hold_est_tradable if api_tradable is None else min(api_tradable, hold_est_tradable)
 
     if resolved is None:
         return None, source
@@ -2183,6 +2185,23 @@ def _collect_active_kraken_unlock_rows(
     return deposit_status, active_rows, active_total
 
 
+def _compute_hold_estimate_tradable_usdt(snapshot: dict, render_now: datetime | None = None) -> Decimal | None:
+    if KRAKEN_DEPOSIT_ESTIMATOR_MODE != "ui":
+        return None
+    if render_now is None:
+        render_now = now_utc()
+    balance = _kraken_decimal_or_none(snapshot.get("balance_usdt"))
+    if balance is None:
+        return None
+    deposit_status, _active_rows, total_usd = _collect_active_kraken_unlock_rows(snapshot, render_now)
+    if deposit_status not in {"ok", "stale"}:
+        return None
+    est_tradable = balance - total_usd
+    if est_tradable < 0:
+        est_tradable = Decimal("0")
+    return est_tradable
+
+
 def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | None = None) -> str:
     if render_now is None:
         render_now = now_utc()
@@ -2210,10 +2229,8 @@ def _format_kraken_dashboard_block_full(snapshot: dict, render_now: datetime | N
             f"{_format_countdown_short(render_now, unlock_at)} &#183; {_format_kraken_display_time_short(unlock_at)}</i>"
         )
 
-    if balance is not None:
-        est_tradable = balance - total_usd
-        if est_tradable < 0:
-            est_tradable = Decimal("0")
+    est_tradable = _compute_hold_estimate_tradable_usdt(snapshot, render_now)
+    if est_tradable is not None:
         lines.append(f"<b>KRAKEN TRADABLE [EST]: {_format_kraken_amount_4(est_tradable)} (USDT)</b>")
 
     if not row_lines:
@@ -2247,10 +2264,8 @@ def _format_kraken_dashboard_block(snapshot: dict, render_now: datetime | None =
     if deposit_status not in {"ok", "stale"}:
         return "\n".join(lines)
 
-    if balance is not None:
-        est_tradable = balance - total_usd
-        if est_tradable < 0:
-            est_tradable = Decimal("0")
+    est_tradable = _compute_hold_estimate_tradable_usdt(snapshot, render_now)
+    if est_tradable is not None:
         lines.append(f"<b>KRAKEN TRADABLE [EST]:</b> {_format_kraken_amount_4(est_tradable)} (USDT)")
 
     if not active_rows:
@@ -3834,83 +3849,84 @@ def _open_banner_photo_payload():
 
 
 async def edit_panel_for_app(chat_id: int, app: Application, text: str, reply_markup: InlineKeyboardMarkup):
-    st = get_chat_state(chat_id)
-    panel_message_id = st.get("panel_message_id")
+    async with _get_panel_render_lock(chat_id):
+        st = get_chat_state(chat_id)
+        panel_message_id = st.get("panel_message_id")
 
-    if not panel_message_id:
-        await send_or_update_panel_for_app(chat_id, app)
-        return
+        if not panel_message_id:
+            await _create_panel_for_app(chat_id, app, text, reply_markup)
+            return
 
-    mode = st.get("panel_mode", "text")
+        mode = st.get("panel_mode", "text")
 
-    # Try banner caption edit if we believe it's banner
-    if mode == "banner":
+        # Try banner caption edit if we believe it's banner
+        if mode == "banner":
+            try:
+                await app.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=panel_message_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            except Exception:
+                set_panel_mode(chat_id, "text")
+
+        # Try text edit
         try:
-            await app.bot.edit_message_caption(
+            await app.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=panel_message_id,
-                caption=text,
+                text=text,
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.HTML,
             )
             return
         except Exception:
-            set_panel_mode(chat_id, "text")
+            # maybe it's actually a banner; try caption edit
+            try:
+                await app.bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=panel_message_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                set_panel_mode(chat_id, "banner")
+                return
+            except Exception:
+                pass
 
-    # Try text edit
-    try:
-        await app.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=panel_message_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    except Exception:
-        # maybe it's actually a banner; try caption edit
+        # If we get here, editing failed. To prevent duplicates:
+        # best-effort delete old panel message, then create a fresh one and store its id.
         try:
-            await app.bot.edit_message_caption(
-                chat_id=chat_id,
-                message_id=panel_message_id,
-                caption=text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.HTML,
-            )
-            set_panel_mode(chat_id, "banner")
-            return
+            await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
         except Exception:
             pass
 
-    # If we get here, editing failed. To prevent duplicates:
-    # best-effort delete old panel message, then create a fresh one and store its id.
-    try:
-        await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
-    except Exception:
-        pass
-
-    set_panel_message_id(chat_id, None)
-    await send_or_update_panel_for_app(chat_id, app)
+        set_panel_message_id(chat_id, None)
+        await _create_panel_for_app(chat_id, app, text, reply_markup)
 
 
 async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup):
     await edit_panel_for_app(chat_id, context.application, text=text, reply_markup=reply_markup)
 
 
-async def send_or_update_panel_for_app(chat_id: int, app: Application):
-    st = get_chat_state(chat_id)
-    g = get_global_state()
-    total_cents = g["total_cents"]
+def _get_panel_render_lock(chat_id: int) -> asyncio.Lock:
+    lock = PANEL_RENDER_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        PANEL_RENDER_LOCKS[chat_id] = lock
+    return lock
 
-    text = build_panel_text(total_cents)
-    kb = build_panel_keyboard(chat_id)
 
-    panel_message_id = st.get("panel_message_id")
-    if panel_message_id:
-        # Try edit; if it fails, edit_panel will delete & recreate
-        await edit_panel_for_app(chat_id, app, text=text, reply_markup=kb)
-        return
-
+async def _create_panel_for_app(
+    chat_id: int,
+    app: Application,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
     # Create new panel: banner if configured, otherwise text
     if _banner_source_available():
         try:
@@ -3920,7 +3936,7 @@ async def send_or_update_panel_for_app(chat_id: int, app: Application):
                         chat_id=chat_id,
                         photo=banner_photo,
                         caption=text,
-                        reply_markup=kb,
+                        reply_markup=reply_markup,
                         parse_mode=ParseMode.HTML,
                         disable_notification=True,
                     )
@@ -3933,28 +3949,88 @@ async def send_or_update_panel_for_app(chat_id: int, app: Application):
     msg = await app.bot.send_message(
         chat_id=chat_id,
         text=text,
-        reply_markup=kb,
+        reply_markup=reply_markup,
         parse_mode=ParseMode.HTML,
         disable_notification=True,
     )
     set_panel_message_id(chat_id, msg.message_id)
 
 
+async def send_or_update_panel_for_app(chat_id: int, app: Application):
+    async with _get_panel_render_lock(chat_id):
+        st = get_chat_state(chat_id)
+        g = get_global_state()
+        total_cents = g["total_cents"]
+
+        text = build_panel_text(total_cents)
+        kb = build_panel_keyboard(chat_id)
+
+        panel_message_id = st.get("panel_message_id")
+        if panel_message_id:
+            mode = st.get("panel_mode", "text")
+
+            if mode == "banner":
+                try:
+                    await app.bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=panel_message_id,
+                        caption=text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                except Exception:
+                    set_panel_mode(chat_id, "text")
+
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=panel_message_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            except Exception:
+                try:
+                    await app.bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=panel_message_id,
+                        caption=text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    set_panel_mode(chat_id, "banner")
+                    return
+                except Exception:
+                    pass
+
+                try:
+                    await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+                except Exception:
+                    pass
+                set_panel_message_id(chat_id, None)
+
+        await _create_panel_for_app(chat_id, app, text, kb)
+
+
 async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     await send_or_update_panel_for_app(chat_id, context.application)
 
 
-async def update_all_panels_for_app(app: Application):
+async def update_all_panels_for_app(app: Application, exclude_chat_id: int | None = None):
     # Update or create exactly one panel per participant
     for uid in get_participants():
+        if exclude_chat_id is not None and uid == exclude_chat_id:
+            continue
         try:
             await send_or_update_panel_for_app(uid, app)
         except Exception:
             logger.warning("panel update failed for user_id=%s", uid, exc_info=True)
 
 
-async def update_all_panels(context: ContextTypes.DEFAULT_TYPE):
-    await update_all_panels_for_app(context.application)
+async def update_all_panels(context: ContextTypes.DEFAULT_TYPE, exclude_chat_id: int | None = None):
+    await update_all_panels_for_app(context.application, exclude_chat_id=exclude_chat_id)
 
 
 # =========================
@@ -4156,10 +4232,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.application.create_task(delete_later(context, update.effective_chat.id, msg.message_id, 10))
         return
 
-    # IMPORTANT FIX: create/update only THIS user's panel first (no duplicates),
-    # then update others (edit existing or create if missing).
+    # Create/update only THIS user's panel first, then update others.
     await send_or_update_panel(update.effective_chat.id, context)
-    await update_all_panels(context)
+    await update_all_panels(context, exclude_chat_id=update.effective_chat.id)
 
 
 # =========================
