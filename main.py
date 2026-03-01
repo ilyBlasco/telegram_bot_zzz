@@ -41,6 +41,7 @@ FEE_PCT = Decimal(os.getenv("FEE_PCT", "0.02"))  # 2% default
 NETWORK_FEE = Decimal(os.getenv("NETWORK_FEE", "0.30"))  # $0.30 flat
 BANNER_URL = os.getenv("BANNER_URL", "").strip()  # optional public image URL
 BANNER_PATH = os.getenv("BANNER_PATH", "").strip()  # optional local image path
+BANNER_FILE_ID = os.getenv("BANNER_FILE_ID", "").strip()  # optional Telegram file_id (fastest)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "").strip()
 KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET", "").strip()
@@ -209,6 +210,10 @@ RELEASE_NOTIFY_DELETE_SECONDS = max(1, int(os.getenv("RELEASE_NOTIFY_DELETE_SECO
 RELEASE_ERROR_DELETE_SECONDS = max(1, int(os.getenv("RELEASE_ERROR_DELETE_SECONDS", "10")))
 BUTTON_SLOW_LOG_MS = max(100, int(os.getenv("BUTTON_SLOW_LOG_MS", "700")))
 PANEL_RENDER_SLOW_LOG_MS = max(100, int(os.getenv("PANEL_RENDER_SLOW_LOG_MS", "500")))
+PANEL_RENDER_POLICY = (os.getenv("PANEL_RENDER_POLICY", "auto").strip().lower() or "auto")
+if PANEL_RENDER_POLICY not in {"auto", "text_only"}:
+    PANEL_RENDER_POLICY = "auto"
+PANEL_BANNER_CAPTION_SAFE_CHARS = max(128, int(os.getenv("PANEL_BANNER_CAPTION_SAFE_CHARS", "900")))
 RELEASE_TRADABLE_SOURCE = (os.getenv("RELEASE_TRADABLE_SOURCE", "conservative").strip().lower() or "conservative")
 if RELEASE_TRADABLE_SOURCE not in {"conservative", "api_only", "est_only"}:
     RELEASE_TRADABLE_SOURCE = "conservative"
@@ -325,6 +330,12 @@ def init_db():
             )
             """
         )
+        chat_state_cols = {
+            str(r["name"]).strip().lower()
+            for r in conn.execute("PRAGMA table_info(chat_state)").fetchall()
+        }
+        if "banner_message_id" not in chat_state_cols:
+            conn.execute("ALTER TABLE chat_state ADD COLUMN banner_message_id INTEGER")
 
         # Global tracker state (shared across all chats/users)
         conn.execute(
@@ -563,11 +574,18 @@ def get_chat_state(chat_id: int) -> dict:
         row = conn.execute("SELECT * FROM chat_state WHERE chat_id = ?", (chat_id,)).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO chat_state(chat_id, panel_message_id, panel_mode) VALUES (?, NULL, 'text')",
+                "INSERT INTO chat_state(chat_id, panel_message_id, panel_mode, banner_message_id) VALUES (?, NULL, 'text', NULL)",
                 (chat_id,),
             )
-            return {"chat_id": chat_id, "panel_message_id": None, "panel_mode": "text"}
-        return dict(row)
+            return {
+                "chat_id": chat_id,
+                "panel_message_id": None,
+                "panel_mode": "text",
+                "banner_message_id": None,
+            }
+        data = dict(row)
+        data.setdefault("banner_message_id", None)
+        return data
 
 
 def set_panel_message_id(chat_id: int, message_id: int | None):
@@ -578,6 +596,17 @@ def set_panel_message_id(chat_id: int, message_id: int | None):
 def set_panel_mode(chat_id: int, mode: str):
     with db() as conn:
         conn.execute("UPDATE chat_state SET panel_mode = ? WHERE chat_id = ?", (mode, chat_id))
+
+
+def set_banner_message_id(chat_id: int, message_id: int | None):
+    with db() as conn:
+        conn.execute("UPDATE chat_state SET banner_message_id = ? WHERE chat_id = ?", (message_id, chat_id))
+
+
+def get_banner_message_id(chat_id: int) -> int | None:
+    state = get_chat_state(chat_id)
+    value = state.get("banner_message_id")
+    return int(value) if value is not None else None
 
 
 # =========================
@@ -4592,8 +4621,21 @@ def _resolve_banner_local_path() -> str | None:
     return None
 
 
+def _resolve_banner_photo_source() -> tuple[str | None, str]:
+    file_id = str(BANNER_FILE_ID or "").strip()
+    if file_id:
+        return file_id, "file_id"
+    local_path = _resolve_banner_local_path()
+    if local_path:
+        return local_path, "path"
+    if BANNER_URL:
+        return BANNER_URL, "url"
+    return None, "none"
+
+
 def _banner_source_available() -> bool:
-    return bool(_resolve_banner_local_path() or BANNER_URL)
+    source, _ = _resolve_banner_photo_source()
+    return bool(source)
 
 
 def _banner_url_looks_suboptimal(url: str | None) -> bool:
@@ -4609,10 +4651,11 @@ def _maybe_warn_banner_source_setup() -> None:
         return
     _BANNER_SOURCE_HINTED = True
 
-    if _resolve_banner_local_path():
+    source, source_kind = _resolve_banner_photo_source()
+    if source and source_kind in {"file_id", "path"}:
         return
 
-    if _banner_url_looks_suboptimal(BANNER_URL):
+    if source_kind == "url" and _banner_url_looks_suboptimal(BANNER_URL):
         logger.warning(
             "BANNER_URL may be slow/non-direct. Prefer local BANNER_PATH or a direct image URL. url=%s",
             str(BANNER_URL or "")[:160],
@@ -4621,20 +4664,53 @@ def _maybe_warn_banner_source_setup() -> None:
 
 @contextlib.contextmanager
 def _open_banner_photo_payload():
-    local_path = _resolve_banner_local_path()
-    if local_path:
+    source, source_kind = _resolve_banner_photo_source()
+    if source_kind == "file_id" and source:
+        yield source
+        return
+    if source_kind == "path" and source:
         fh = None
         try:
-            fh = open(local_path, "rb")
+            fh = open(source, "rb")
             yield fh
         finally:
             if fh:
                 fh.close()
         return
-    if BANNER_URL:
-        yield BANNER_URL
+    if source_kind == "url" and source:
+        yield source
         return
     yield None
+
+
+async def _send_or_refresh_banner_for_chat(app: Application, chat_id: int) -> None:
+    source, source_kind = _resolve_banner_photo_source()
+    if not source:
+        return
+
+    async with _get_panel_render_lock(chat_id):
+        st = get_chat_state(chat_id)
+        if st.get("banner_message_id"):
+            return
+
+        try:
+            with _open_banner_photo_payload() as banner_photo:
+                if banner_photo is None:
+                    return
+                msg = await app.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=banner_photo,
+                    disable_notification=True,
+                )
+            set_banner_message_id(chat_id, msg.message_id)
+            logger.info(
+                "Banner sent chat_id=%s message_id=%s source=%s",
+                chat_id,
+                msg.message_id,
+                source_kind,
+            )
+        except Exception:
+            logger.warning("Banner send failed chat_id=%s source=%s", chat_id, source_kind, exc_info=True)
 
 
 def _get_panel_render_lock(chat_id: int) -> asyncio.Lock:
@@ -4645,9 +4721,18 @@ def _get_panel_render_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
-def _resolve_target_panel_mode(view_mode: str) -> str:
+def _banner_caption_too_long(text: str) -> bool:
+    # Keep headroom below Telegram caption limits to avoid repeated mode thrash.
+    return len(str(text or "")) > PANEL_BANNER_CAPTION_SAFE_CHARS
+
+
+def _resolve_target_panel_mode(view_mode: str, text: str) -> str:
+    if PANEL_RENDER_POLICY == "text_only":
+        return "text"
     normalized = str(view_mode or "dashboard").strip().lower()
     if normalized == "text_only":
+        return "text"
+    if normalized == "dashboard" and _banner_caption_too_long(text):
         return "text"
     return "banner" if _banner_source_available() else "text"
 
@@ -4699,7 +4784,7 @@ async def _render_panel_for_app(
     reason: str | None = None,
 ) -> None:
     started = time.perf_counter()
-    target_mode = _resolve_target_panel_mode(view_mode)
+    target_mode = _resolve_target_panel_mode(view_mode, text)
     render_path = "unknown"
     render_error: str | None = None
 
@@ -4718,19 +4803,31 @@ async def _render_panel_for_app(
             )
             render_path = f"create_{target_mode}"
         elif current_mode != target_mode:
+            deleted_old_panel = False
             try:
                 await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
-            except Exception:
-                pass
-            set_panel_message_id(chat_id, None)
-            await _create_panel_for_app(
-                chat_id,
-                app,
-                text,
-                reply_markup,
-                target_mode=target_mode,
-            )
-            render_path = f"recreate_{target_mode}_mode_switch"
+                deleted_old_panel = True
+            except Exception as e:
+                render_error = f"{type(e).__name__}:{str(e)[:120]}"
+                logger.warning(
+                    "Panel mode switch delete failed chat_id=%s target_mode=%s policy=%s; skipping recreate to avoid duplicates",
+                    chat_id,
+                    target_mode,
+                    PANEL_RENDER_POLICY,
+                    exc_info=True,
+                )
+            if deleted_old_panel:
+                set_panel_message_id(chat_id, None)
+                await _create_panel_for_app(
+                    chat_id,
+                    app,
+                    text,
+                    reply_markup,
+                    target_mode=target_mode,
+                )
+                render_path = f"recreate_{target_mode}_mode_switch"
+            else:
+                render_path = f"skip_recreate_{target_mode}_delete_fail"
         elif target_mode == "banner":
             try:
                 await app.bot.edit_message_caption(
@@ -4743,19 +4840,29 @@ async def _render_panel_for_app(
                 render_path = "banner_edit"
             except Exception as e:
                 render_error = f"{type(e).__name__}:{str(e)[:120]}"
+                deleted_old_panel = False
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+                    deleted_old_panel = True
                 except Exception:
-                    pass
-                set_panel_message_id(chat_id, None)
-                await _create_panel_for_app(
-                    chat_id,
-                    app,
-                    text,
-                    reply_markup,
-                    target_mode=target_mode,
-                )
-                render_path = "recreate_banner_edit_fail"
+                    logger.warning(
+                        "Panel banner edit recovery delete failed chat_id=%s policy=%s; skipping recreate to avoid duplicates",
+                        chat_id,
+                        PANEL_RENDER_POLICY,
+                        exc_info=True,
+                    )
+                if deleted_old_panel:
+                    set_panel_message_id(chat_id, None)
+                    await _create_panel_for_app(
+                        chat_id,
+                        app,
+                        text,
+                        reply_markup,
+                        target_mode=target_mode,
+                    )
+                    render_path = "recreate_banner_edit_fail"
+                else:
+                    render_path = "skip_recreate_banner_delete_fail"
         else:
             try:
                 await app.bot.edit_message_text(
@@ -4768,27 +4875,42 @@ async def _render_panel_for_app(
                 render_path = "text_edit"
             except Exception as e:
                 render_error = f"{type(e).__name__}:{str(e)[:120]}"
+                deleted_old_panel = False
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+                    deleted_old_panel = True
                 except Exception:
-                    pass
-                set_panel_message_id(chat_id, None)
-                await _create_panel_for_app(
-                    chat_id,
-                    app,
-                    text,
-                    reply_markup,
-                    target_mode=target_mode,
-                )
-                render_path = "recreate_text_edit_fail"
+                    logger.warning(
+                        "Panel text edit recovery delete failed chat_id=%s policy=%s; skipping recreate to avoid duplicates",
+                        chat_id,
+                        PANEL_RENDER_POLICY,
+                        exc_info=True,
+                    )
+                if deleted_old_panel:
+                    set_panel_message_id(chat_id, None)
+                    await _create_panel_for_app(
+                        chat_id,
+                        app,
+                        text,
+                        reply_markup,
+                        target_mode=target_mode,
+                    )
+                    render_path = "recreate_text_edit_fail"
+                else:
+                    render_path = "skip_recreate_text_delete_fail"
 
     elapsed_ms = (time.perf_counter() - started) * 1000
-    if elapsed_ms >= PANEL_RENDER_SLOW_LOG_MS or render_path.startswith("recreate_"):
+    if (
+        elapsed_ms >= PANEL_RENDER_SLOW_LOG_MS
+        or render_path.startswith("recreate_")
+        or render_path.startswith("skip_recreate_")
+    ):
         logger.info(
-            "Panel render chat_id=%s view_mode=%s target_mode=%s path=%s elapsed_ms=%.1f reason=%s err=%s",
+            "Panel render chat_id=%s view_mode=%s target_mode=%s policy=%s path=%s elapsed_ms=%.1f reason=%s err=%s",
             chat_id,
             view_mode,
             target_mode,
+            PANEL_RENDER_POLICY,
             render_path,
             elapsed_ms,
             reason or "-",
@@ -5056,20 +5178,26 @@ async def undo_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user:
+    chat = update.effective_chat
+    if not user or not chat:
         return
 
     await cleanup_expired_confirmations(context)
 
     ok = add_participant(user.id, user.first_name, user.username)
     if not ok:
-        msg = await update.effective_chat.send_message("Este tracker ya está completo (máximo 2 usuarios).")
-        context.application.create_task(delete_later(context, update.effective_chat.id, msg.message_id, 10))
+        msg = await chat.send_message("Este tracker ya está completo (máximo 2 usuarios).")
+        context.application.create_task(delete_later(context, chat.id, msg.message_id, 10))
         return
 
-    # Create/update only THIS user's panel first, then update others.
-    await send_or_update_panel(update.effective_chat.id, context)
-    await update_all_panels(context, exclude_chat_id=update.effective_chat.id)
+    # Fast path: render this chat immediately, then fan out in background.
+    await send_or_update_panel(chat.id, context)
+
+    if PANEL_RENDER_POLICY == "text_only" and _banner_source_available():
+        context.application.create_task(_send_or_refresh_banner_for_chat(context.application, chat.id))
+        logger.info("Banner task scheduled chat_id=%s policy=%s", chat.id, PANEL_RENDER_POLICY)
+
+    context.application.create_task(update_all_panels_for_app(context.application, exclude_chat_id=chat.id))
 
 
 # =========================
@@ -5670,6 +5798,13 @@ async def on_app_init(app: Application):
     global KRAKEN_REFRESH_TASK, GMAIL_ZELLE_TASK
 
     _maybe_warn_banner_source_setup()
+    _, banner_source_kind = _resolve_banner_photo_source()
+    logger.info(
+        "Panel render policy=%s caption_safe_chars=%s banner_source=%s",
+        PANEL_RENDER_POLICY,
+        PANEL_BANNER_CAPTION_SAFE_CHARS,
+        banner_source_kind,
+    )
 
     if not KRAKEN_CACHE["enabled"]:
         logger.info("Kraken balance dashboard line enabled in placeholder mode (missing Kraken API creds)")
