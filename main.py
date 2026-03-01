@@ -213,6 +213,9 @@ PANEL_RENDER_SLOW_LOG_MS = max(100, int(os.getenv("PANEL_RENDER_SLOW_LOG_MS", "5
 PANEL_RENDER_POLICY = (os.getenv("PANEL_RENDER_POLICY", "auto").strip().lower() or "auto")
 if PANEL_RENDER_POLICY not in {"auto", "text_only"}:
     PANEL_RENDER_POLICY = "auto"
+PANEL_SUBVIEW_POLICY = (os.getenv("PANEL_SUBVIEW_POLICY", "inline").strip().lower() or "inline")
+if PANEL_SUBVIEW_POLICY not in {"inline", "popup"}:
+    PANEL_SUBVIEW_POLICY = "inline"
 PANEL_BANNER_CAPTION_SAFE_CHARS = max(128, int(os.getenv("PANEL_BANNER_CAPTION_SAFE_CHARS", "900")))
 RELEASE_TRADABLE_SOURCE = (os.getenv("RELEASE_TRADABLE_SOURCE", "conservative").strip().lower() or "conservative")
 if RELEASE_TRADABLE_SOURCE not in {"conservative", "api_only", "est_only"}:
@@ -336,6 +339,8 @@ def init_db():
         }
         if "banner_message_id" not in chat_state_cols:
             conn.execute("ALTER TABLE chat_state ADD COLUMN banner_message_id INTEGER")
+        if "subview_message_id" not in chat_state_cols:
+            conn.execute("ALTER TABLE chat_state ADD COLUMN subview_message_id INTEGER")
 
         # Global tracker state (shared across all chats/users)
         conn.execute(
@@ -574,7 +579,7 @@ def get_chat_state(chat_id: int) -> dict:
         row = conn.execute("SELECT * FROM chat_state WHERE chat_id = ?", (chat_id,)).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO chat_state(chat_id, panel_message_id, panel_mode, banner_message_id) VALUES (?, NULL, 'text', NULL)",
+                "INSERT INTO chat_state(chat_id, panel_message_id, panel_mode, banner_message_id, subview_message_id) VALUES (?, NULL, 'text', NULL, NULL)",
                 (chat_id,),
             )
             return {
@@ -582,9 +587,11 @@ def get_chat_state(chat_id: int) -> dict:
                 "panel_message_id": None,
                 "panel_mode": "text",
                 "banner_message_id": None,
+                "subview_message_id": None,
             }
         data = dict(row)
         data.setdefault("banner_message_id", None)
+        data.setdefault("subview_message_id", None)
         return data
 
 
@@ -606,6 +613,17 @@ def set_banner_message_id(chat_id: int, message_id: int | None):
 def get_banner_message_id(chat_id: int) -> int | None:
     state = get_chat_state(chat_id)
     value = state.get("banner_message_id")
+    return int(value) if value is not None else None
+
+
+def set_subview_message_id(chat_id: int, message_id: int | None):
+    with db() as conn:
+        conn.execute("UPDATE chat_state SET subview_message_id = ? WHERE chat_id = ?", (message_id, chat_id))
+
+
+def get_subview_message_id(chat_id: int) -> int | None:
+    state = get_chat_state(chat_id)
+    value = state.get("subview_message_id")
     return int(value) if value is not None else None
 
 
@@ -1501,7 +1519,7 @@ def build_admin_reverse_list_keyboard(page: int, rows: list[dict], has_prev: boo
         nav.append(InlineKeyboardButton("Next ➡", callback_data=f"adminrev:page:{page + 1}"))
     if nav:
         kb_rows.append(nav)
-    kb_rows.append([InlineKeyboardButton("Volver", callback_data="back")])
+    kb_rows.append(_build_subview_control_row())
     return InlineKeyboardMarkup(kb_rows)
 
 
@@ -1532,6 +1550,7 @@ def build_admin_reverse_confirm_keyboard(gmail_message_id: str, *, is_reversed: 
             ]
         )
     rows.append([InlineKeyboardButton("⬅ Volver", callback_data="adminrev")])
+    rows.append(_build_subview_control_row())
     return InlineKeyboardMarkup(rows)
 
 
@@ -4365,12 +4384,21 @@ def build_panel_keyboard(viewer_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _build_subview_control_row() -> list[InlineKeyboardButton]:
+    if PANEL_SUBVIEW_POLICY == "popup":
+        return [
+            InlineKeyboardButton("⬅ Dashboard", callback_data="back_main"),
+            InlineKeyboardButton("✖ Close", callback_data="close_subview"),
+        ]
+    return [InlineKeyboardButton("Volver", callback_data="back")]
+
+
 def build_back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="back")]])
+    return InlineKeyboardMarkup([_build_subview_control_row()])
 
 
 def build_back_to_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Volver al panel", callback_data="back")]])
+    return InlineKeyboardMarkup([_build_subview_control_row()])
 
 
 def build_confirm_keyboard(movement_id: int) -> InlineKeyboardMarkup:
@@ -4404,7 +4432,7 @@ def build_senders_list_keyboard(page: int, has_prev: bool, has_next: bool) -> In
         nav.append(InlineKeyboardButton("Next ➡", callback_data=f"senders:page:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("Volver", callback_data="back")])
+    rows.append(_build_subview_control_row())
     return InlineKeyboardMarkup(rows)
 
 
@@ -4417,7 +4445,7 @@ def build_history_keyboard(page: int, has_prev: bool, has_next: bool) -> InlineK
         nav.append(InlineKeyboardButton("Next ➡", callback_data=f"history:page:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("Volver", callback_data="back")])
+    rows.append(_build_subview_control_row())
     return InlineKeyboardMarkup(rows)
 
 
@@ -4721,6 +4749,194 @@ def _get_panel_render_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
+def _is_message_missing_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    missing_markers = (
+        "message to edit not found",
+        "message to delete not found",
+        "message not found",
+        "message identifier is not specified",
+    )
+    return any(marker in text for marker in missing_markers)
+
+
+def _is_message_not_modified_error(exc: Exception) -> bool:
+    return "message is not modified" in str(exc or "").strip().lower()
+
+
+async def _create_subview_for_app(
+    chat_id: int,
+    app: Application,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    msg = await app.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_notification=True,
+    )
+    set_subview_message_id(chat_id, msg.message_id)
+
+
+async def _render_subview_for_app(
+    chat_id: int,
+    app: Application,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    reason: str | None = None,
+) -> None:
+    started = time.perf_counter()
+    render_path = "unknown"
+    render_error: str | None = None
+
+    async with _get_panel_render_lock(chat_id):
+        st = get_chat_state(chat_id)
+        subview_message_id = st.get("subview_message_id")
+        if not subview_message_id:
+            await _create_subview_for_app(chat_id, app, text, reply_markup)
+            render_path = "subview_create"
+        else:
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=subview_message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                render_path = "subview_edit"
+            except Exception as e:
+                render_error = f"{type(e).__name__}:{str(e)[:120]}"
+                if _is_message_not_modified_error(e):
+                    render_path = "subview_not_modified"
+                elif _is_message_missing_error(e):
+                    set_subview_message_id(chat_id, None)
+                    await _create_subview_for_app(chat_id, app, text, reply_markup)
+                    render_path = "subview_recreate_missing"
+                else:
+                    deleted_old_subview = False
+                    try:
+                        await app.bot.delete_message(chat_id=chat_id, message_id=subview_message_id)
+                        deleted_old_subview = True
+                    except Exception:
+                        logger.warning(
+                            "Subview recovery delete failed chat_id=%s; skipping recreate to avoid duplicates",
+                            chat_id,
+                            exc_info=True,
+                        )
+                    if deleted_old_subview:
+                        set_subview_message_id(chat_id, None)
+                        await _create_subview_for_app(chat_id, app, text, reply_markup)
+                        render_path = "subview_recreate_edit_fail"
+                    else:
+                        render_path = "subview_skip_recreate_delete_fail"
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if (
+        elapsed_ms >= PANEL_RENDER_SLOW_LOG_MS
+        or render_path.startswith("subview_recreate")
+        or render_path.startswith("subview_skip_recreate")
+    ):
+        logger.info(
+            "Subview render chat_id=%s policy=%s path=%s elapsed_ms=%.1f reason=%s err=%s",
+            chat_id,
+            PANEL_SUBVIEW_POLICY,
+            render_path,
+            elapsed_ms,
+            reason or "-",
+            render_error or "-",
+        )
+
+
+async def close_subview_for_app(
+    chat_id: int,
+    app: Application,
+    *,
+    message_id_hint: int | None = None,
+    reason: str | None = None,
+) -> None:
+    started = time.perf_counter()
+    closed = False
+    render_error: str | None = None
+
+    async with _get_panel_render_lock(chat_id):
+        st = get_chat_state(chat_id)
+        subview_message_id = st.get("subview_message_id")
+        candidate_ids: list[int] = []
+        if subview_message_id:
+            candidate_ids.append(int(subview_message_id))
+        if message_id_hint and message_id_hint not in candidate_ids:
+            candidate_ids.append(int(message_id_hint))
+
+        for msg_id in candidate_ids:
+            try:
+                await app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                closed = True
+            except Exception as e:
+                render_error = f"{type(e).__name__}:{str(e)[:120]}"
+                if _is_message_missing_error(e):
+                    closed = True
+                else:
+                    logger.warning("Subview close delete failed chat_id=%s message_id=%s", chat_id, msg_id, exc_info=True)
+
+        if closed:
+            set_subview_message_id(chat_id, None)
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if elapsed_ms >= PANEL_RENDER_SLOW_LOG_MS:
+        logger.info(
+            "Subview close chat_id=%s policy=%s elapsed_ms=%.1f reason=%s err=%s",
+            chat_id,
+            PANEL_SUBVIEW_POLICY,
+            elapsed_ms,
+            reason or "-",
+            render_error or "-",
+        )
+
+
+async def show_subview_for_app(
+    chat_id: int,
+    app: Application,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    reason: str | None = None,
+) -> None:
+    if PANEL_SUBVIEW_POLICY == "popup":
+        await _render_subview_for_app(chat_id, app, text, reply_markup, reason=reason)
+        return
+    await _render_panel_for_app(
+        chat_id,
+        app,
+        text,
+        reply_markup,
+        view_mode="text_only",
+        reason=reason or "subview_inline",
+    )
+
+
+async def show_subview(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    reason: str | None = None,
+) -> None:
+    await show_subview_for_app(
+        chat_id,
+        context.application,
+        text=text,
+        reply_markup=reply_markup,
+        reason=reason,
+    )
+
+
 def _banner_caption_too_long(text: str) -> bool:
     # Keep headroom below Telegram caption limits to avoid repeated mode thrash.
     return len(str(text or "")) > PANEL_BANNER_CAPTION_SAFE_CHARS
@@ -4804,18 +5020,30 @@ async def _render_panel_for_app(
             render_path = f"create_{target_mode}"
         elif current_mode != target_mode:
             deleted_old_panel = False
+            recreated_after_missing = False
             try:
                 await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
                 deleted_old_panel = True
             except Exception as e:
                 render_error = f"{type(e).__name__}:{str(e)[:120]}"
-                logger.warning(
-                    "Panel mode switch delete failed chat_id=%s target_mode=%s policy=%s; skipping recreate to avoid duplicates",
-                    chat_id,
-                    target_mode,
-                    PANEL_RENDER_POLICY,
-                    exc_info=True,
-                )
+                if _is_message_missing_error(e):
+                    set_panel_message_id(chat_id, None)
+                    await _create_panel_for_app(
+                        chat_id,
+                        app,
+                        text,
+                        reply_markup,
+                        target_mode=target_mode,
+                    )
+                    recreated_after_missing = True
+                else:
+                    logger.warning(
+                        "Panel mode switch delete failed chat_id=%s target_mode=%s policy=%s; skipping recreate to avoid duplicates",
+                        chat_id,
+                        target_mode,
+                        PANEL_RENDER_POLICY,
+                        exc_info=True,
+                    )
             if deleted_old_panel:
                 set_panel_message_id(chat_id, None)
                 await _create_panel_for_app(
@@ -4826,6 +5054,8 @@ async def _render_panel_for_app(
                     target_mode=target_mode,
                 )
                 render_path = f"recreate_{target_mode}_mode_switch"
+            elif recreated_after_missing:
+                render_path = f"recreate_{target_mode}_mode_switch_missing"
             else:
                 render_path = f"skip_recreate_{target_mode}_delete_fail"
         elif target_mode == "banner":
@@ -4840,18 +5070,9 @@ async def _render_panel_for_app(
                 render_path = "banner_edit"
             except Exception as e:
                 render_error = f"{type(e).__name__}:{str(e)[:120]}"
-                deleted_old_panel = False
-                try:
-                    await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
-                    deleted_old_panel = True
-                except Exception:
-                    logger.warning(
-                        "Panel banner edit recovery delete failed chat_id=%s policy=%s; skipping recreate to avoid duplicates",
-                        chat_id,
-                        PANEL_RENDER_POLICY,
-                        exc_info=True,
-                    )
-                if deleted_old_panel:
+                if _is_message_not_modified_error(e):
+                    render_path = "banner_not_modified"
+                elif _is_message_missing_error(e):
                     set_panel_message_id(chat_id, None)
                     await _create_panel_for_app(
                         chat_id,
@@ -4860,9 +5081,31 @@ async def _render_panel_for_app(
                         reply_markup,
                         target_mode=target_mode,
                     )
-                    render_path = "recreate_banner_edit_fail"
+                    render_path = "recreate_banner_edit_missing"
                 else:
-                    render_path = "skip_recreate_banner_delete_fail"
+                    deleted_old_panel = False
+                    try:
+                        await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+                        deleted_old_panel = True
+                    except Exception:
+                        logger.warning(
+                            "Panel banner edit recovery delete failed chat_id=%s policy=%s; skipping recreate to avoid duplicates",
+                            chat_id,
+                            PANEL_RENDER_POLICY,
+                            exc_info=True,
+                        )
+                    if deleted_old_panel:
+                        set_panel_message_id(chat_id, None)
+                        await _create_panel_for_app(
+                            chat_id,
+                            app,
+                            text,
+                            reply_markup,
+                            target_mode=target_mode,
+                        )
+                        render_path = "recreate_banner_edit_fail"
+                    else:
+                        render_path = "skip_recreate_banner_delete_fail"
         else:
             try:
                 await app.bot.edit_message_text(
@@ -4875,18 +5118,9 @@ async def _render_panel_for_app(
                 render_path = "text_edit"
             except Exception as e:
                 render_error = f"{type(e).__name__}:{str(e)[:120]}"
-                deleted_old_panel = False
-                try:
-                    await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
-                    deleted_old_panel = True
-                except Exception:
-                    logger.warning(
-                        "Panel text edit recovery delete failed chat_id=%s policy=%s; skipping recreate to avoid duplicates",
-                        chat_id,
-                        PANEL_RENDER_POLICY,
-                        exc_info=True,
-                    )
-                if deleted_old_panel:
+                if _is_message_not_modified_error(e):
+                    render_path = "text_not_modified"
+                elif _is_message_missing_error(e):
                     set_panel_message_id(chat_id, None)
                     await _create_panel_for_app(
                         chat_id,
@@ -4895,9 +5129,31 @@ async def _render_panel_for_app(
                         reply_markup,
                         target_mode=target_mode,
                     )
-                    render_path = "recreate_text_edit_fail"
+                    render_path = "recreate_text_edit_missing"
                 else:
-                    render_path = "skip_recreate_text_delete_fail"
+                    deleted_old_panel = False
+                    try:
+                        await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+                        deleted_old_panel = True
+                    except Exception:
+                        logger.warning(
+                            "Panel text edit recovery delete failed chat_id=%s policy=%s; skipping recreate to avoid duplicates",
+                            chat_id,
+                            PANEL_RENDER_POLICY,
+                            exc_info=True,
+                        )
+                    if deleted_old_panel:
+                        set_panel_message_id(chat_id, None)
+                        await _create_panel_for_app(
+                            chat_id,
+                            app,
+                            text,
+                            reply_markup,
+                            target_mode=target_mode,
+                        )
+                        render_path = "recreate_text_edit_fail"
+                    else:
+                        render_path = "skip_recreate_text_delete_fail"
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     if (
@@ -5227,6 +5483,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tracking_mode = get_tracking_mode()
 
+        if data in {"close_subview", "back_main"}:
+            hint_message_id = query.message.message_id if (query and query.message) else None
+            await close_subview_for_app(
+                update.effective_chat.id,
+                context.application,
+                message_id_hint=hint_message_id,
+                reason=data,
+            )
+            if data == "back_main":
+                await send_or_update_panel(update.effective_chat.id, context)
+            return
+
         if data.startswith("trackmode:"):
             confirmer_id = get_confirmer_id()
             if not confirmer_id or user.id != confirmer_id:
@@ -5291,7 +5559,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             AWAITING_CUSTOM_AMOUNT.add(user.id)
 
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=(
@@ -5300,7 +5568,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"<i>Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s.</i>"
                 ),
                 reply_markup=build_back_keyboard(),
-                view_mode="text_only",
                 reason="custom_view",
             )
             return
@@ -5308,23 +5575,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "senders":
             page = 0
             list_text, has_prev, has_next = build_senders_list_text(page=page, viewer_id=user.id)
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=list_text,
                 reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
-                view_mode="text_only",
                 reason="senders_view",
             )
             return
 
         if data == "krakenview":
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=build_kraken_details_text(),
                 reply_markup=build_kraken_details_keyboard(),
-                view_mode="text_only",
                 reason="kraken_view",
             )
             return
@@ -5335,12 +5600,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 page = 0
             list_text, has_prev, has_next = build_senders_list_text(page=page, viewer_id=user.id)
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=list_text,
                 reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
-                view_mode="text_only",
                 reason="senders_page",
             )
             return
@@ -5351,12 +5615,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             page = 0
             list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=list_text,
                 reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
-                view_mode="text_only",
                 reason="adminrev_list",
             )
             return
@@ -5370,12 +5633,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 page = 0
             list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=list_text,
                 reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
-                view_mode="text_only",
                 reason="adminrev_page",
             )
             return
@@ -5387,16 +5649,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gmail_message_id = data.split(":", 2)[2].strip()
             event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
             if not event:
-                await edit_panel(
+                await show_subview(
                     update.effective_chat.id,
                     context,
                     text="<b>Admin Reverse</b>\n\n<i>La transaccion ya no esta disponible.</i>",
                     reply_markup=build_back_keyboard(),
-                    view_mode="text_only",
                     reason="adminrev_missing",
                 )
                 return
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=build_admin_reverse_confirm_text(event),
@@ -5404,7 +5665,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     gmail_message_id,
                     is_reversed=bool(event.get("is_reversed")),
                 ),
-                view_mode="text_only",
                 reason="adminrev_confirm",
             )
             return
@@ -5448,7 +5708,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
             if event:
-                await edit_panel(
+                await show_subview(
                     update.effective_chat.id,
                     context,
                     text=build_admin_reverse_confirm_text(event),
@@ -5456,18 +5716,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         gmail_message_id,
                         is_reversed=bool(event.get("is_reversed")),
                     ),
-                    view_mode="text_only",
                     reason="adminrev_post_action",
                 )
             else:
                 page = 0
                 list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
-                await edit_panel(
+                await show_subview(
                     update.effective_chat.id,
                     context,
                     text=list_text,
                     reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
-                    view_mode="text_only",
                     reason="adminrev_post_action_list",
                 )
             return
@@ -5639,7 +5897,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             AWAITING_CUSTOM_AMOUNT.discard(user.id)
 
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=(
@@ -5651,7 +5909,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "El total se reinicio a <b>$0.00</b>."
                 ),
                 reply_markup=build_back_to_panel_keyboard(),
-                view_mode="text_only",
                 reason="release_summary",
             )
 
@@ -5661,12 +5918,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "history":
             page = 0
             hist_text, has_prev, has_next, page = build_history_page_text(page)
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=hist_text,
                 reply_markup=build_history_keyboard(page, has_prev, has_next),
-                view_mode="text_only",
                 reason="history_view",
             )
             return
@@ -5677,17 +5933,25 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 page = 0
             hist_text, has_prev, has_next, page = build_history_page_text(page)
-            await edit_panel(
+            await show_subview(
                 update.effective_chat.id,
                 context,
                 text=hist_text,
                 reply_markup=build_history_keyboard(page, has_prev, has_next),
-                view_mode="text_only",
                 reason="history_page",
             )
             return
 
         if data == "back":
+            if PANEL_SUBVIEW_POLICY == "popup":
+                hint_message_id = query.message.message_id if (query and query.message) else None
+                await close_subview_for_app(
+                    update.effective_chat.id,
+                    context.application,
+                    message_id_hint=hint_message_id,
+                    reason="back_popup",
+                )
+                return
             g = get_global_state()
             total_cents = g["total_cents"]
             await edit_panel(
@@ -5800,8 +6064,9 @@ async def on_app_init(app: Application):
     _maybe_warn_banner_source_setup()
     _, banner_source_kind = _resolve_banner_photo_source()
     logger.info(
-        "Panel render policy=%s caption_safe_chars=%s banner_source=%s",
+        "Panel render policy=%s subview_policy=%s caption_safe_chars=%s banner_source=%s",
         PANEL_RENDER_POLICY,
+        PANEL_SUBVIEW_POLICY,
         PANEL_BANNER_CAPTION_SAFE_CHARS,
         banner_source_kind,
     )
