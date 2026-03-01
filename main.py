@@ -207,6 +207,8 @@ TRACKING_MODE_NOTIFY_DELETE_SECONDS = 15
 ADMIN_REVERSE_UI_LOOKBACK_HOURS = 24
 RELEASE_NOTIFY_DELETE_SECONDS = max(1, int(os.getenv("RELEASE_NOTIFY_DELETE_SECONDS", "86400")))
 RELEASE_ERROR_DELETE_SECONDS = max(1, int(os.getenv("RELEASE_ERROR_DELETE_SECONDS", "10")))
+BUTTON_SLOW_LOG_MS = max(100, int(os.getenv("BUTTON_SLOW_LOG_MS", "700")))
+PANEL_RENDER_SLOW_LOG_MS = max(100, int(os.getenv("PANEL_RENDER_SLOW_LOG_MS", "500")))
 RELEASE_TRADABLE_SOURCE = (os.getenv("RELEASE_TRADABLE_SOURCE", "conservative").strip().lower() or "conservative")
 if RELEASE_TRADABLE_SOURCE not in {"conservative", "api_only", "est_only"}:
     RELEASE_TRADABLE_SOURCE = "conservative"
@@ -246,6 +248,7 @@ _GMAIL_ZELLE_MODE_WARNED = False
 _GMAIL_ZELLE_LABEL_ID_CACHE: str | None = None
 _GMAIL_ZELLE_IMPORT_ERROR_WARNED = False
 _BANNER_PATH_WARNED = False
+_BANNER_SOURCE_HINTED = False
 
 GMAIL_ZELLE_STATUS: dict = {
     "enabled": GMAIL_ZELLE_ENABLED,
@@ -297,6 +300,7 @@ KRAKEN_CACHE: dict = {
 
 GMAIL_SENDER_LIST_PAGE_SIZE = 10
 ADMIN_REVERSE_PAGE_SIZE = 5
+HISTORY_PAGE_SIZE = 10
 
 
 # =========================
@@ -461,6 +465,19 @@ def init_db():
                 reversed_at TEXT NOT NULL
             )
             """
+        )
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_movements_session_id_id_desc ON movements(session_id, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gmail_processed_status_movement ON gmail_processed_messages(status, movement_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gmail_reversals_reversal_movement_id ON gmail_reversals(reversal_movement_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_confirmations_state_expiry ON confirmations(is_confirmed, expires_at)"
         )
 
 
@@ -4362,6 +4379,132 @@ def build_senders_list_keyboard(page: int, has_prev: bool, has_next: bool) -> In
     return InlineKeyboardMarkup(rows)
 
 
+def build_history_keyboard(page: int, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"history:page:{max(0, page - 1)}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"history:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("Volver", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _load_history_page_rows(session_id: int, page: int) -> tuple[list[sqlite3.Row], bool]:
+    page = max(0, page)
+    offset = page * HISTORY_PAGE_SIZE
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, kind, amount_cents, total_after_cents, actor_id, created_at
+            FROM movements
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (session_id, HISTORY_PAGE_SIZE + 1, offset),
+        ).fetchall()
+    has_next = len(rows) > HISTORY_PAGE_SIZE
+    if has_next:
+        rows = rows[:HISTORY_PAGE_SIZE]
+    return rows, has_next
+
+
+def build_history_page_text(page: int) -> tuple[str, bool, bool, int]:
+    current_page = max(0, page)
+    session_id = int(get_global_state()["session_id"])
+    rows, has_next = _load_history_page_rows(session_id, current_page)
+    if current_page > 0 and not rows:
+        current_page = 0
+        rows, has_next = _load_history_page_rows(session_id, current_page)
+    has_prev = current_page > 0
+
+    if not rows:
+        return "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro.", has_prev, has_next, current_page
+
+    participant_names = get_participant_display_name_map()
+    movement_ids = [int(r["id"]) for r in rows if r["id"] is not None]
+    gmail_payer_by_movement: dict[int, str] = {}
+    reversal_payer_by_movement: dict[int, str] = {}
+    if movement_ids:
+        placeholders = ",".join("?" for _ in movement_ids)
+        with db() as conn:
+            gmail_rows = conn.execute(
+                f"""
+                SELECT movement_id, notes
+                FROM gmail_processed_messages
+                WHERE status = 'added'
+                  AND movement_id IN ({placeholders})
+                """,
+                tuple(movement_ids),
+            ).fetchall()
+            rev_rows = conn.execute(
+                f"""
+                SELECT reversal_movement_id, payer_display
+                FROM gmail_reversals
+                WHERE reversal_movement_id IN ({placeholders})
+                """,
+                tuple(movement_ids),
+            ).fetchall()
+
+        for gr in gmail_rows:
+            if gr["movement_id"] is None:
+                continue
+            meta = _json_loads_object_or_none(gr["notes"])
+            if not meta:
+                continue
+            payer = str(meta.get("payer_display") or meta.get("identity_display") or "").strip()
+            if payer:
+                gmail_payer_by_movement[int(gr["movement_id"])] = payer
+
+        for rr in rev_rows:
+            if rr["reversal_movement_id"] is None:
+                continue
+            payer = str(rr["payer_display"] or "").strip()
+            if payer:
+                reversal_payer_by_movement[int(rr["reversal_movement_id"])] = payer
+
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    lines = [f"<b>📜 History (sesión actual · página {current_page + 1})</b>", ""]
+    for r in rows:
+        dt_utc = datetime.fromisoformat(r["created_at"])
+        ts = f"{dt_utc.day:02d} {months[dt_utc.month - 1]} {dt_utc.year}"
+
+        movement_id = int(r["id"])
+        kind = str(r["kind"] or "")
+        amt_cents = int(r["amount_cents"] or 0)
+        total_after_cents = int(r["total_after_cents"] or 0)
+        actor_id = int(r["actor_id"]) if r["actor_id"] is not None else None
+        actor_name = participant_names.get(actor_id or -1)
+        display_name = None
+        if kind == "add":
+            label = "Add"
+            amount_disp = f"${cents_to_money_str(amt_cents)}"
+            display_name = gmail_payer_by_movement.get(movement_id) or actor_name
+        elif kind == "release":
+            label = "Release"
+            amount_disp = f"${cents_to_money_str(amt_cents)}"
+            display_name = actor_name
+        elif kind == "reversal":
+            label = "Reversal"
+            amount_disp = f"-${cents_to_money_str(amt_cents)}"
+            display_name = reversal_payer_by_movement.get(movement_id) or actor_name
+        else:
+            label = kind
+            amount_disp = f"${cents_to_money_str(amt_cents)}"
+            display_name = actor_name
+        name_suffix = f" &#183; {_html_escape(display_name)}" if display_name else ""
+        lines.append(
+            f"&#183; <b>{_html_escape(label)}{name_suffix}</b>: <code>{amount_disp}</code> "
+            f"&#8594; Total: <code>${cents_to_money_str(total_after_cents)}</code>\n"
+            f"  <i>{ts}</i>"
+        )
+
+    return "\n".join(lines), has_prev, has_next, current_page
+
+
 # =========================
 # DELETE HELPERS / NOTIFY
 # =========================
@@ -4453,6 +4596,29 @@ def _banner_source_available() -> bool:
     return bool(_resolve_banner_local_path() or BANNER_URL)
 
 
+def _banner_url_looks_suboptimal(url: str | None) -> bool:
+    value = str(url or "").strip().lower()
+    if not value:
+        return False
+    return ("github.com" in value and "/blob/" in value) or ("drive.google.com" in value)
+
+
+def _maybe_warn_banner_source_setup() -> None:
+    global _BANNER_SOURCE_HINTED
+    if _BANNER_SOURCE_HINTED:
+        return
+    _BANNER_SOURCE_HINTED = True
+
+    if _resolve_banner_local_path():
+        return
+
+    if _banner_url_looks_suboptimal(BANNER_URL):
+        logger.warning(
+            "BANNER_URL may be slow/non-direct. Prefer local BANNER_PATH or a direct image URL. url=%s",
+            str(BANNER_URL or "")[:160],
+        )
+
+
 @contextlib.contextmanager
 def _open_banner_photo_payload():
     local_path = _resolve_banner_local_path()
@@ -4471,71 +4637,6 @@ def _open_banner_photo_payload():
     yield None
 
 
-async def edit_panel_for_app(chat_id: int, app: Application, text: str, reply_markup: InlineKeyboardMarkup):
-    async with _get_panel_render_lock(chat_id):
-        st = get_chat_state(chat_id)
-        panel_message_id = st.get("panel_message_id")
-
-        if not panel_message_id:
-            await _create_panel_for_app(chat_id, app, text, reply_markup)
-            return
-
-        mode = st.get("panel_mode", "text")
-
-        # Try banner caption edit if we believe it's banner
-        if mode == "banner":
-            try:
-                await app.bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=panel_message_id,
-                    caption=text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            except Exception:
-                set_panel_mode(chat_id, "text")
-
-        # Try text edit
-        try:
-            await app.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=panel_message_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except Exception:
-            # maybe it's actually a banner; try caption edit
-            try:
-                await app.bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=panel_message_id,
-                    caption=text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.HTML,
-                )
-                set_panel_mode(chat_id, "banner")
-                return
-            except Exception:
-                pass
-
-        # If we get here, editing failed. To prevent duplicates:
-        # best-effort delete old panel message, then create a fresh one and store its id.
-        try:
-            await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
-        except Exception:
-            pass
-
-        set_panel_message_id(chat_id, None)
-        await _create_panel_for_app(chat_id, app, text, reply_markup)
-
-
-async def edit_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: InlineKeyboardMarkup):
-    await edit_panel_for_app(chat_id, context.application, text=text, reply_markup=reply_markup)
-
-
 def _get_panel_render_lock(chat_id: int) -> asyncio.Lock:
     lock = PANEL_RENDER_LOCKS.get(chat_id)
     if lock is None:
@@ -4544,14 +4645,22 @@ def _get_panel_render_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
+def _resolve_target_panel_mode(view_mode: str) -> str:
+    normalized = str(view_mode or "dashboard").strip().lower()
+    if normalized == "text_only":
+        return "text"
+    return "banner" if _banner_source_available() else "text"
+
+
 async def _create_panel_for_app(
     chat_id: int,
     app: Application,
     text: str,
     reply_markup: InlineKeyboardMarkup,
+    *,
+    target_mode: str,
 ) -> None:
-    # Create new panel: banner if configured, otherwise text
-    if _banner_source_available():
+    if target_mode == "banner":
         try:
             with _open_banner_photo_payload() as banner_photo:
                 if banner_photo is not None:
@@ -4567,7 +4676,7 @@ async def _create_panel_for_app(
                     set_panel_message_id(chat_id, msg.message_id)
                     return
         except Exception:
-            set_panel_mode(chat_id, "text")
+            logger.warning("Banner panel send failed for chat_id=%s; falling back to text", chat_id, exc_info=True)
 
     msg = await app.bot.send_message(
         chat_id=chat_id,
@@ -4576,69 +4685,172 @@ async def _create_panel_for_app(
         parse_mode=ParseMode.HTML,
         disable_notification=True,
     )
+    set_panel_mode(chat_id, "text")
     set_panel_message_id(chat_id, msg.message_id)
 
 
-async def send_or_update_panel_for_app(chat_id: int, app: Application):
+async def _render_panel_for_app(
+    chat_id: int,
+    app: Application,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    view_mode: str = "dashboard",
+    reason: str | None = None,
+) -> None:
+    started = time.perf_counter()
+    target_mode = _resolve_target_panel_mode(view_mode)
+    render_path = "unknown"
+    render_error: str | None = None
+
     async with _get_panel_render_lock(chat_id):
         st = get_chat_state(chat_id)
-        g = get_global_state()
-        total_cents = g["total_cents"]
-
-        text = build_panel_text(total_cents)
-        kb = build_panel_keyboard(chat_id)
-
         panel_message_id = st.get("panel_message_id")
-        if panel_message_id:
-            mode = st.get("panel_mode", "text")
+        current_mode = st.get("panel_mode", "text")
 
-            if mode == "banner":
-                try:
-                    await app.bot.edit_message_caption(
-                        chat_id=chat_id,
-                        message_id=panel_message_id,
-                        caption=text,
-                        reply_markup=kb,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
-                except Exception:
-                    set_panel_mode(chat_id, "text")
-
+        if not panel_message_id:
+            await _create_panel_for_app(
+                chat_id,
+                app,
+                text,
+                reply_markup,
+                target_mode=target_mode,
+            )
+            render_path = f"create_{target_mode}"
+        elif current_mode != target_mode:
             try:
-                await app.bot.edit_message_text(
+                await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+            except Exception:
+                pass
+            set_panel_message_id(chat_id, None)
+            await _create_panel_for_app(
+                chat_id,
+                app,
+                text,
+                reply_markup,
+                target_mode=target_mode,
+            )
+            render_path = f"recreate_{target_mode}_mode_switch"
+        elif target_mode == "banner":
+            try:
+                await app.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=panel_message_id,
-                    text=text,
-                    reply_markup=kb,
+                    caption=text,
+                    reply_markup=reply_markup,
                     parse_mode=ParseMode.HTML,
                 )
-                return
-            except Exception:
-                try:
-                    await app.bot.edit_message_caption(
-                        chat_id=chat_id,
-                        message_id=panel_message_id,
-                        caption=text,
-                        reply_markup=kb,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    set_panel_mode(chat_id, "banner")
-                    return
-                except Exception:
-                    pass
-
+                render_path = "banner_edit"
+            except Exception as e:
+                render_error = f"{type(e).__name__}:{str(e)[:120]}"
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
                 except Exception:
                     pass
                 set_panel_message_id(chat_id, None)
+                await _create_panel_for_app(
+                    chat_id,
+                    app,
+                    text,
+                    reply_markup,
+                    target_mode=target_mode,
+                )
+                render_path = "recreate_banner_edit_fail"
+        else:
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=panel_message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                render_path = "text_edit"
+            except Exception as e:
+                render_error = f"{type(e).__name__}:{str(e)[:120]}"
+                try:
+                    await app.bot.delete_message(chat_id=chat_id, message_id=panel_message_id)
+                except Exception:
+                    pass
+                set_panel_message_id(chat_id, None)
+                await _create_panel_for_app(
+                    chat_id,
+                    app,
+                    text,
+                    reply_markup,
+                    target_mode=target_mode,
+                )
+                render_path = "recreate_text_edit_fail"
 
-        await _create_panel_for_app(chat_id, app, text, kb)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if elapsed_ms >= PANEL_RENDER_SLOW_LOG_MS or render_path.startswith("recreate_"):
+        logger.info(
+            "Panel render chat_id=%s view_mode=%s target_mode=%s path=%s elapsed_ms=%.1f reason=%s err=%s",
+            chat_id,
+            view_mode,
+            target_mode,
+            render_path,
+            elapsed_ms,
+            reason or "-",
+            render_error or "-",
+        )
+
+
+async def edit_panel_for_app(
+    chat_id: int,
+    app: Application,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    view_mode: str = "dashboard",
+    reason: str | None = None,
+):
+    await _render_panel_for_app(
+        chat_id,
+        app,
+        text,
+        reply_markup,
+        view_mode=view_mode,
+        reason=reason,
+    )
+
+
+async def edit_panel(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    view_mode: str = "dashboard",
+    reason: str | None = None,
+):
+    await edit_panel_for_app(
+        chat_id,
+        context.application,
+        text=text,
+        reply_markup=reply_markup,
+        view_mode=view_mode,
+        reason=reason,
+    )
+
+
+async def send_or_update_panel_for_app(chat_id: int, app: Application, *, reason: str | None = None):
+    g = get_global_state()
+    total_cents = g["total_cents"]
+    text = build_panel_text(total_cents)
+    kb = build_panel_keyboard(chat_id)
+    await _render_panel_for_app(
+        chat_id,
+        app,
+        text,
+        kb,
+        view_mode="dashboard",
+        reason=reason or "panel_sync",
+    )
 
 
 async def send_or_update_panel(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    await send_or_update_panel_for_app(chat_id, context.application)
+    await send_or_update_panel_for_app(chat_id, context.application, reason="panel_sync")
 
 
 async def update_all_panels_for_app(app: Application, exclude_chat_id: int | None = None):
@@ -4647,7 +4859,7 @@ async def update_all_panels_for_app(app: Application, exclude_chat_id: int | Non
         if exclude_chat_id is not None and uid == exclude_chat_id:
             continue
         try:
-            await send_or_update_panel_for_app(uid, app)
+            await send_or_update_panel_for_app(uid, app, reason="bulk_sync")
         except Exception:
             logger.warning("panel update failed for user_id=%s", uid, exc_info=True)
 
@@ -4864,230 +5076,198 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # BUTTON HANDLER
 # =========================
 
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
-    # IMPORTANT FIX: Always answer query ASAP to avoid the "loading spinner forever",
-    # even if we later reject due to permissions.
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
+    started = time.perf_counter()
     user = update.effective_user
-    if not user or not is_participant(user.id):
-        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    data = (query.data or "") if query else ""
 
-    await cleanup_expired_confirmations(context)
-
-    data = query.data or ""
-    tracking_mode = get_tracking_mode()
-
-    if data.startswith("trackmode:"):
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
-            return
+    try:
+        # IMPORTANT FIX: Always answer query ASAP to avoid the "loading spinner forever",
+        # even if we later reject due to permissions.
         try:
-            target_mode = _normalize_tracking_mode(data.split(":", 1)[1])
+            await query.answer()
         except Exception:
+            pass
+
+        if not user or not is_participant(user.id):
             return
 
-        async with STATE_LOCK:
-            mode_result = set_tracking_mode_tx(target_mode, user.id)
+        await cleanup_expired_confirmations(context)
 
-        new_mode = str(mode_result.get("mode") or target_mode)
-        GMAIL_ZELLE_STATUS["tracking_mode"] = new_mode
-        if new_mode == "auto":
-            AWAITING_CUSTOM_AMOUNT.clear()
+        tracking_mode = get_tracking_mode()
 
-        await update_all_panels(context)
+        if data.startswith("trackmode:"):
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+            try:
+                target_mode = _normalize_tracking_mode(data.split(":", 1)[1])
+            except Exception:
+                return
 
-        if bool(mode_result.get("changed")):
-            await notify_for_app(
-                context.application,
-                (
-                    "<b>Tracking mode</b>\n"
-                    f"Modo activo: <b>{_html_escape(new_mode.upper())}</b>"
-                ),
-                delete_seconds=TRACKING_MODE_NOTIFY_DELETE_SECONDS,
-            )
-        return
+            async with STATE_LOCK:
+                mode_result = set_tracking_mode_tx(target_mode, user.id)
 
-    if data.startswith("add:"):
-        if tracking_mode != "manual":
+            new_mode = str(mode_result.get("mode") or target_mode)
+            GMAIL_ZELLE_STATUS["tracking_mode"] = new_mode
+            if new_mode == "auto":
+                AWAITING_CUSTOM_AMOUNT.clear()
+
+            await update_all_panels(context)
+
+            if bool(mode_result.get("changed")):
+                await notify_for_app(
+                    context.application,
+                    (
+                        "<b>Tracking mode</b>\n"
+                        f"Modo activo: <b>{_html_escape(new_mode.upper())}</b>"
+                    ),
+                    delete_seconds=TRACKING_MODE_NOTIFY_DELETE_SECONDS,
+                )
             return
-        add_amount = data.split(":", 1)[1]
-        add_cents = money_to_cents(add_amount)
 
-        async with STATE_LOCK:
-            movement_id, total_cents = add_amount_with_confirmation(user.id, add_cents)
+        if data.startswith("add:"):
+            if tracking_mode != "manual":
+                return
+            add_amount = data.split(":", 1)[1]
+            add_cents = money_to_cents(add_amount)
 
-        await notify(
-            context,
-            (
-                f"{_tracker_brand_title_html()}\n"
-                f"Se agregó: <code>${cents_to_money_str(add_cents)}</code>\n"
-                f"Total: <code>${cents_to_money_str(total_cents)}</code>"
-            ),
-        )
+            async with STATE_LOCK:
+                movement_id, total_cents = add_amount_with_confirmation(user.id, add_cents)
 
-        await send_confirmation_request_to_confirmer(
-            context=context,
-            movement_id=movement_id,
-            amount_cents=add_cents,
-            actor_id=user.id,
-        )
-
-        await update_all_panels(context)
-        return
-
-    if data == "custom":
-        if tracking_mode != "manual":
-            AWAITING_CUSTOM_AMOUNT.discard(user.id)
-            return
-        AWAITING_CUSTOM_AMOUNT.add(user.id)
-
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=(
-                "<b>✍ Custom</b>\n\n"
-                "Envía un número como <code>420</code> o <code>420.50</code>, Sin letras ni símbolos.\n\n"
-                f"<i>Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s.</i>"
-            ),
-            reply_markup=build_back_keyboard(),
-        )
-        return
-
-    if data == "senders":
-        page = 0
-        list_text, has_prev, has_next = build_senders_list_text(page=page, viewer_id=user.id)
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=list_text,
-            reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
-        )
-        return
-
-    if data == "krakenview":
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=build_kraken_details_text(),
-            reply_markup=build_kraken_details_keyboard(),
-        )
-        return
-
-    if data.startswith("senders:page:"):
-        try:
-            page = max(0, int(data.split(":", 2)[2]))
-        except Exception:
-            page = 0
-        list_text, has_prev, has_next = build_senders_list_text(page=page, viewer_id=user.id)
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=list_text,
-            reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
-        )
-        return
-
-    if data == "adminrev":
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
-            return
-        page = 0
-        list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=list_text,
-            reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
-        )
-        return
-
-    if data.startswith("adminrev:page:"):
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
-            return
-        try:
-            page = max(0, int(data.split(":", 2)[2]))
-        except Exception:
-            page = 0
-        list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=list_text,
-            reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
-        )
-        return
-
-    if data.startswith("adminrev:select:"):
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
-            return
-        gmail_message_id = data.split(":", 2)[2].strip()
-        event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
-        if not event:
-            await edit_panel(
-                update.effective_chat.id,
-                context,
-                text="<b>🛠 Admin Reverse</b>\n\n<i>La transacción ya no está disponible.</i>",
-                reply_markup=build_back_keyboard(),
-            )
-            return
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=build_admin_reverse_confirm_text(event),
-            reply_markup=build_admin_reverse_confirm_keyboard(
-                gmail_message_id,
-                is_reversed=bool(event.get("is_reversed")),
-            ),
-        )
-        return
-
-    if data.startswith("adminrev:do:") or data.startswith("adminrev:block_and_do:"):
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
-            return
-        try:
-            _, action, gmail_message_id = data.split(":", 2)
-        except Exception:
-            return
-        block_payer = action == "block_and_do"
-
-        async with STATE_LOCK:
-            reverse_result = admin_reverse_gmail_event_tx(gmail_message_id, user.id, block_payer=block_payer)
-
-        status = str(reverse_result.get("status") or "")
-        if status == "reversed":
-            payer_display = _html_escape(reverse_result.get("payer_display") or "Desconocido")
-            amount_cents = int(reverse_result.get("amount_cents") or 0)
-            blocked_applied = bool(reverse_result.get("blocked_applied"))
-            extra = "\n<i>Payer bloqueado.</i>" if blocked_applied else ""
             await notify(
                 context,
                 (
-                    "<b>🛠 Admin Reverse</b>\n"
-                    f"Payer: <code>{payer_display}</code>\n"
-                    f"Reversa aplicada: <code>${cents_to_money_str(amount_cents)}</code>\n"
-                    f"Total: <code>${cents_to_money_str(int(reverse_result.get('new_total_cents') or 0))}</code>"
-                    f"{extra}"
+                    f"{_tracker_brand_title_html()}\n"
+                    f"Se agrego: <code>${cents_to_money_str(add_cents)}</code>\n"
+                    f"Total: <code>${cents_to_money_str(total_cents)}</code>"
                 ),
             )
-            await update_all_panels(context)
-        elif status == "already_reversed":
-            await notify(context, "<b>🛠 Admin Reverse</b>\nEsa transacción ya fue revertida.")
-        elif status == "missing":
-            await notify(context, "<b>🛠 Admin Reverse</b>\nNo encontré esa transacción.")
-        else:
-            await notify(context, "<b>🛠 Admin Reverse</b>\nNo se pudo aplicar la reversa.")
 
-        event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
-        if event:
+            await send_confirmation_request_to_confirmer(
+                context=context,
+                movement_id=movement_id,
+                amount_cents=add_cents,
+                actor_id=user.id,
+            )
+
+            await update_all_panels(context)
+            return
+
+        if data == "custom":
+            if tracking_mode != "manual":
+                AWAITING_CUSTOM_AMOUNT.discard(user.id)
+                return
+            AWAITING_CUSTOM_AMOUNT.add(user.id)
+
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=(
+                    "<b>Custom</b>\n\n"
+                    "Envia un numero como <code>420</code> o <code>420.50</code>, sin letras ni simbolos.\n\n"
+                    f"<i>Los mensajes desaparecen en {NOTIFY_DELETE_SECONDS}s.</i>"
+                ),
+                reply_markup=build_back_keyboard(),
+                view_mode="text_only",
+                reason="custom_view",
+            )
+            return
+
+        if data == "senders":
+            page = 0
+            list_text, has_prev, has_next = build_senders_list_text(page=page, viewer_id=user.id)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=list_text,
+                reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
+                view_mode="text_only",
+                reason="senders_view",
+            )
+            return
+
+        if data == "krakenview":
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=build_kraken_details_text(),
+                reply_markup=build_kraken_details_keyboard(),
+                view_mode="text_only",
+                reason="kraken_view",
+            )
+            return
+
+        if data.startswith("senders:page:"):
+            try:
+                page = max(0, int(data.split(":", 2)[2]))
+            except Exception:
+                page = 0
+            list_text, has_prev, has_next = build_senders_list_text(page=page, viewer_id=user.id)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=list_text,
+                reply_markup=build_senders_list_keyboard(page, has_prev, has_next),
+                view_mode="text_only",
+                reason="senders_page",
+            )
+            return
+
+        if data == "adminrev":
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+            page = 0
+            list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=list_text,
+                reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+                view_mode="text_only",
+                reason="adminrev_list",
+            )
+            return
+
+        if data.startswith("adminrev:page:"):
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+            try:
+                page = max(0, int(data.split(":", 2)[2]))
+            except Exception:
+                page = 0
+            list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=list_text,
+                reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+                view_mode="text_only",
+                reason="adminrev_page",
+            )
+            return
+
+        if data.startswith("adminrev:select:"):
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+            gmail_message_id = data.split(":", 2)[2].strip()
+            event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
+            if not event:
+                await edit_panel(
+                    update.effective_chat.id,
+                    context,
+                    text="<b>Admin Reverse</b>\n\n<i>La transaccion ya no esta disponible.</i>",
+                    reply_markup=build_back_keyboard(),
+                    view_mode="text_only",
+                    reason="adminrev_missing",
+                )
+                return
             await edit_panel(
                 update.effective_chat.id,
                 context,
@@ -5096,314 +5276,311 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     gmail_message_id,
                     is_reversed=bool(event.get("is_reversed")),
                 ),
+                view_mode="text_only",
+                reason="adminrev_confirm",
             )
-        else:
-            page = 0
-            list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+            return
+
+        if data.startswith("adminrev:do:") or data.startswith("adminrev:block_and_do:"):
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+            try:
+                _, action, gmail_message_id = data.split(":", 2)
+            except Exception:
+                return
+            block_payer = action == "block_and_do"
+
+            async with STATE_LOCK:
+                reverse_result = admin_reverse_gmail_event_tx(gmail_message_id, user.id, block_payer=block_payer)
+
+            status = str(reverse_result.get("status") or "")
+            if status == "reversed":
+                payer_display = _html_escape(reverse_result.get("payer_display") or "Desconocido")
+                amount_cents = int(reverse_result.get("amount_cents") or 0)
+                blocked_applied = bool(reverse_result.get("blocked_applied"))
+                extra = "\n<i>Payer bloqueado.</i>" if blocked_applied else ""
+                await notify(
+                    context,
+                    (
+                        "<b>Admin Reverse</b>\n"
+                        f"Payer: <code>{payer_display}</code>\n"
+                        f"Reversa aplicada: <code>${cents_to_money_str(amount_cents)}</code>\n"
+                        f"Total: <code>${cents_to_money_str(int(reverse_result.get('new_total_cents') or 0))}</code>"
+                        f"{extra}"
+                    ),
+                )
+                await update_all_panels(context)
+            elif status == "already_reversed":
+                await notify(context, "<b>Admin Reverse</b>\nEsa transaccion ya fue revertida.")
+            elif status == "missing":
+                await notify(context, "<b>Admin Reverse</b>\nNo encontre esa transaccion.")
+            else:
+                await notify(context, "<b>Admin Reverse</b>\nNo se pudo aplicar la reversa.")
+
+            event = get_recent_gmail_auto_added_event_by_message_id(gmail_message_id)
+            if event:
+                await edit_panel(
+                    update.effective_chat.id,
+                    context,
+                    text=build_admin_reverse_confirm_text(event),
+                    reply_markup=build_admin_reverse_confirm_keyboard(
+                        gmail_message_id,
+                        is_reversed=bool(event.get("is_reversed")),
+                    ),
+                    view_mode="text_only",
+                    reason="adminrev_post_action",
+                )
+            else:
+                page = 0
+                list_text, rows, has_prev, has_next = build_admin_reverse_list_text(page=page, viewer_id=user.id)
+                await edit_panel(
+                    update.effective_chat.id,
+                    context,
+                    text=list_text,
+                    reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+                    view_mode="text_only",
+                    reason="adminrev_post_action_list",
+                )
+            return
+
+        if data == "undo":
+            if tracking_mode != "manual":
+                return
+            await undo_last(update, context)
+            return
+
+        if data.startswith("confirm:"):
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+
+            try:
+                movement_id = int(data.split(":", 1)[1])
+            except Exception:
+                return
+
+            async with STATE_LOCK:
+                confirm_result = confirm_movement_tx(movement_id, user.id)
+
+            status = confirm_result["status"]
+            if status == "missing":
+                try:
+                    await query.edit_message_text("Confirmacion ya no existe.", parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+                await update_all_panels(context)
+                return
+
+            if status == "already_confirmed":
+                await try_delete_confirm_message(context, movement_id)
+                await update_all_panels(context)
+                return
+
+            await try_delete_confirm_message(context, movement_id)
+
+            amount_cents = int(confirm_result["amount_cents"])
+            actor_id = int(confirm_result["actor_id"])
+
+            if actor_id != user.id:
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=actor_id,
+                        text=(
+                            "<b>Confirmado</b>\n"
+                            f"Blasco confirmo: <code>${cents_to_money_str(amount_cents)}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    context.application.create_task(delete_later(context, actor_id, msg.message_id, NOTIFY_DELETE_SECONDS))
+                except Exception:
+                    pass
+
+            await update_all_panels(context)
+            return
+
+        if data.startswith("sendertrust:"):
+            confirmer_id = get_confirmer_id()
+            if not confirmer_id or user.id != confirmer_id:
+                return
+
+            try:
+                _, action, sender_id_raw = data.split(":", 2)
+                sender_trust_id = int(sender_id_raw)
+            except Exception:
+                return
+
+            async with STATE_LOCK:
+                trust_result = sendertrust_action_tx(sender_trust_id, action, user.id)
+
+            status = str(trust_result.get("status") or "")
+            if status == "missing":
+                try:
+                    await query.edit_message_text("Ese remitente ya no existe en la tabla de confianza.")
+                except Exception:
+                    pass
+                return
+
+            if status == "invalid_action":
+                return
+
+            sender_email = _html_escape(trust_result.get("sender_email"))
+            if status == "approved":
+                text = (
+                    "<b>Sender trusted</b>\n"
+                    f"<code>{sender_email}</code>\n"
+                    "<i>Los proximos correos de este remitente se auto-agregaran.</i>"
+                )
+            elif status == "blocked":
+                text = (
+                    "<b>Sender blocked</b>\n"
+                    f"<code>{sender_email}</code>\n"
+                    "<i>Los correos futuros de este remitente no se agregaran.</i>"
+                )
+            else:
+                text = (
+                    "<b>Sender ignored</b>\n"
+                    f"<code>{sender_email}</code>\n"
+                    "<i>Sigue en cuarentena.</i>"
+                )
+
+            try:
+                await query.edit_message_text(text=text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            return
+
+        if data == "release":
+            guard_error_text = None
+            async with STATE_LOCK:
+                g_now = get_global_state()
+                total_cents_requested = int(g_now["total_cents"])
+                required_usdt = Decimal(total_cents_requested) / Decimal(100)
+                if required_usdt > 0:
+                    effective_tradable_usdt, tradable_source = _resolve_release_effective_tradable_usdt()
+                    if effective_tradable_usdt is None:
+                        guard_error_text = (
+                            "<b>No hay suficiente cantidad tradable.</b>\n"
+                            "<i>Tradable no disponible en Kraken ahora mismo.</i>"
+                        )
+                    elif effective_tradable_usdt < required_usdt:
+                        guard_error_text = (
+                            "<b>No hay suficiente cantidad tradable.</b>\n"
+                            f"Disponible: <code>${_format_money_decimal_2(effective_tradable_usdt)}</code>\n"
+                            f"Requerido: <code>${cents_to_money_str(total_cents_requested)}</code>\n"
+                            f"<i>Fuente: {_html_escape(tradable_source)}</i>"
+                        )
+
+                release_info = None if guard_error_text else release_current_total(user.id)
+
+            if guard_error_text:
+                await notify_for_app(
+                    context.application,
+                    guard_error_text,
+                    delete_seconds=RELEASE_ERROR_DELETE_SECONDS,
+                )
+                await update_all_panels(context)
+                return
+
+            if not release_info:
+                await notify_for_app(
+                    context.application,
+                    "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.",
+                    delete_seconds=RELEASE_ERROR_DELETE_SECONDS,
+                )
+                await update_all_panels(context)
+                return
+
+            total_cents = int(release_info["total_cents"])
+            fee_cents = int(release_info["fee_cents"])
+            network_fee_cents = int(release_info["network_fee_cents"])
+            net_cents = int(release_info["net_cents"])
+
+            await notify_for_app(
+                context.application,
+                (
+                    f"{_tracker_brand_title_html()}\n"
+                    "<b>Release</b>\n"
+                    f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
+                    f"Fee: <code>${cents_to_money_str(fee_cents)}</code>\n"
+                    f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
+                    f"Net: <code>${cents_to_money_str(net_cents)}</code>"
+                ),
+                delete_seconds=RELEASE_NOTIFY_DELETE_SECONDS,
+            )
+
+            AWAITING_CUSTOM_AMOUNT.discard(user.id)
+
             await edit_panel(
                 update.effective_chat.id,
                 context,
-                text=list_text,
-                reply_markup=build_admin_reverse_list_keyboard(page, rows, has_prev, has_next),
+                text=(
+                    "<b>Released</b>\n\n"
+                    f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
+                    f"Fee ({(FEE_PCT*100):.0f}%): <code>${cents_to_money_str(fee_cents)}</code>\n"
+                    f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
+                    f"Net: <code>${cents_to_money_str(net_cents)}</code>\n\n"
+                    "El total se reinicio a <b>$0.00</b>."
+                ),
+                reply_markup=build_back_to_panel_keyboard(),
+                view_mode="text_only",
+                reason="release_summary",
             )
-        return
 
-    if data == "undo":
-        if tracking_mode != "manual":
-            return
-        await undo_last(update, context)
-        return
-
-    if data.startswith("confirm:"):
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
+            await update_all_panels(context)
             return
 
-        try:
-            movement_id = int(data.split(":", 1)[1])
-        except Exception:
+        if data == "history":
+            page = 0
+            hist_text, has_prev, has_next, page = build_history_page_text(page)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=hist_text,
+                reply_markup=build_history_keyboard(page, has_prev, has_next),
+                view_mode="text_only",
+                reason="history_view",
+            )
             return
 
-        async with STATE_LOCK:
-            confirm_result = confirm_movement_tx(movement_id, user.id)
-
-        status = confirm_result["status"]
-        if status == "missing":
+        if data.startswith("history:page:"):
             try:
-                await query.edit_message_text("Confirmación ya no existe.", parse_mode=ParseMode.HTML)
+                page = max(0, int(data.split(":", 2)[2]))
             except Exception:
-                pass
-            await update_all_panels(context)
-            return
-
-        if status == "already_confirmed":
-            await try_delete_confirm_message(context, movement_id)
-            await update_all_panels(context)
-            return
-
-        await try_delete_confirm_message(context, movement_id)
-
-        amount_cents = int(confirm_result["amount_cents"])
-        actor_id = int(confirm_result["actor_id"])
-
-        # Notify actor (auto-delete normal)
-        if actor_id != user.id:
-            try:
-                msg = await context.bot.send_message(
-                    chat_id=actor_id,
-                    text=(
-                        "<b>Confirmado</b>\n"
-                        f"Blasco confirmó: <code>${cents_to_money_str(amount_cents)}</code>"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-                context.application.create_task(delete_later(context, actor_id, msg.message_id, NOTIFY_DELETE_SECONDS))
-            except Exception:
-                pass
-
-        await update_all_panels(context)
-        return
-    if data.startswith("sendertrust:"):
-        confirmer_id = get_confirmer_id()
-        if not confirmer_id or user.id != confirmer_id:
-            return
-
-        try:
-            _, action, sender_id_raw = data.split(":", 2)
-            sender_trust_id = int(sender_id_raw)
-        except Exception:
-            return
-
-        async with STATE_LOCK:
-            trust_result = sendertrust_action_tx(sender_trust_id, action, user.id)
-
-        status = str(trust_result.get("status") or "")
-        if status == "missing":
-            try:
-                await query.edit_message_text("Ese remitente ya no existe en la tabla de confianza.")
-            except Exception:
-                pass
-            return
-
-        if status == "invalid_action":
-            return
-
-        sender_email = _html_escape(trust_result.get("sender_email"))
-        if status == "approved":
-            text = (
-                "<b>Sender trusted</b>\n"
-                f"<code>{sender_email}</code>\n"
-                "<i>Los próximos correos de este remitente se auto-agregarán.</i>"
+                page = 0
+            hist_text, has_prev, has_next, page = build_history_page_text(page)
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=hist_text,
+                reply_markup=build_history_keyboard(page, has_prev, has_next),
+                view_mode="text_only",
+                reason="history_page",
             )
-        elif status == "blocked":
-            text = (
-                "<b>Sender blocked</b>\n"
-                f"<code>{sender_email}</code>\n"
-                "<i>Los correos futuros de este remitente no se agregarán.</i>"
-            )
-        else:
-            text = (
-                "<b>Sender ignored</b>\n"
-                f"<code>{sender_email}</code>\n"
-                "<i>Sigue en cuarentena.</i>"
-            )
-
-        try:
-            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        return
-    if data == "release":
-        guard_error_text = None
-        async with STATE_LOCK:
-            g_now = get_global_state()
-            total_cents_requested = int(g_now["total_cents"])
-            required_usdt = Decimal(total_cents_requested) / Decimal(100)
-            if required_usdt > 0:
-                effective_tradable_usdt, tradable_source = _resolve_release_effective_tradable_usdt()
-                if effective_tradable_usdt is None:
-                    guard_error_text = (
-                        "<b>No hay suficiente cantidad tradable.</b>\n"
-                        "<i>Tradable no disponible en Kraken ahora mismo.</i>"
-                    )
-                elif effective_tradable_usdt < required_usdt:
-                    guard_error_text = (
-                        "<b>No hay suficiente cantidad tradable.</b>\n"
-                        f"Disponible: <code>${_format_money_decimal_2(effective_tradable_usdt)}</code>\n"
-                        f"Requerido: <code>${cents_to_money_str(total_cents_requested)}</code>\n"
-                        f"<i>Fuente: {_html_escape(tradable_source)}</i>"
-                    )
-
-            release_info = None if guard_error_text else release_current_total(user.id)
-
-        if guard_error_text:
-            await notify_for_app(
-                context.application,
-                guard_error_text,
-                delete_seconds=RELEASE_ERROR_DELETE_SECONDS,
-            )
-            await update_all_panels(context)
             return
 
-        if not release_info:
-            # Non-toxic, stable behavior: do nothing besides notifying
-            await notify_for_app(
-                context.application,
-                "La cantidad que intentas retirar es <b>$0.00</b>, Magistral.",
-                delete_seconds=RELEASE_ERROR_DELETE_SECONDS,
+        if data == "back":
+            g = get_global_state()
+            total_cents = g["total_cents"]
+            await edit_panel(
+                update.effective_chat.id,
+                context,
+                text=build_panel_text(total_cents),
+                reply_markup=build_panel_keyboard(update.effective_chat.id),
+                view_mode="dashboard",
+                reason="back_to_dashboard",
             )
-            await update_all_panels(context)
             return
-
-        total_cents = int(release_info["total_cents"])
-        fee_cents = int(release_info["fee_cents"])
-        network_fee_cents = int(release_info["network_fee_cents"])
-        net_cents = int(release_info["net_cents"])
-
-        await notify_for_app(
-            context.application,
-            (
-                f"{_tracker_brand_title_html()}\n"
-                "<b>解Release除</b>\n"
-                f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
-                f"Fee: <code>${cents_to_money_str(fee_cents)}</code>\n"
-                f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
-                f"Net: <code>${cents_to_money_str(net_cents)}</code>"
-            ),
-            delete_seconds=RELEASE_NOTIFY_DELETE_SECONDS,
-        )
-
-        AWAITING_CUSTOM_AMOUNT.discard(user.id)
-
-        # Show release summary in the current chat panel momentarily, then back
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=(
-                "<b>Released</b>\n\n"
-                f"Total: <code>${cents_to_money_str(total_cents)}</code>\n"
-                f"Fee ({(FEE_PCT*100):.0f}%): <code>${cents_to_money_str(fee_cents)}</code>\n"
-                f"Network fee: <code>${cents_to_money_str(network_fee_cents)}</code>\n"
-                f"Net: <code>${cents_to_money_str(net_cents)}</code>\n\n"
-                "El total se reinició a <b>$0.00</b>."
-            ),
-            reply_markup=build_back_to_panel_keyboard(),
-        )
-
-        await update_all_panels(context)
-        return
-
-    if data == "history":
-        g = get_global_state()
-        session_id = g["session_id"]
-
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, kind, amount_cents, total_after_cents, actor_id, created_at
-                FROM movements
-                WHERE session_id = ?
-                ORDER BY id DESC
-                LIMIT 20
-                """,
-                (session_id,),
-            ).fetchall()
-
-        if not rows:
-            hist_text = "<b>📜 History</b>\n\nNo hay movimientos en esta sesión todavía bro."
-        else:
-            participant_names = get_participant_display_name_map()
-            movement_ids = [int(r["id"]) for r in rows if r["id"] is not None]
-            gmail_payer_by_movement: dict[int, str] = {}
-            reversal_payer_by_movement: dict[int, str] = {}
-            if movement_ids:
-                placeholders = ",".join("?" for _ in movement_ids)
-                with db() as conn:
-                    gmail_rows = conn.execute(
-                        f"""
-                        SELECT movement_id, notes
-                        FROM gmail_processed_messages
-                        WHERE status = 'added'
-                          AND movement_id IN ({placeholders})
-                        """,
-                        tuple(movement_ids),
-                    ).fetchall()
-                    rev_rows = conn.execute(
-                        f"""
-                        SELECT reversal_movement_id, payer_display
-                        FROM gmail_reversals
-                        WHERE reversal_movement_id IN ({placeholders})
-                        """,
-                        tuple(movement_ids),
-                    ).fetchall()
-
-                for gr in gmail_rows:
-                    if gr["movement_id"] is None:
-                        continue
-                    meta = _json_loads_object_or_none(gr["notes"])
-                    if not meta:
-                        continue
-                    payer = str(meta.get("payer_display") or meta.get("identity_display") or "").strip()
-                    if payer:
-                        gmail_payer_by_movement[int(gr["movement_id"])] = payer
-
-                for rr in rev_rows:
-                    if rr["reversal_movement_id"] is None:
-                        continue
-                    payer = str(rr["payer_display"] or "").strip()
-                    if payer:
-                        reversal_payer_by_movement[int(rr["reversal_movement_id"])] = payer
-
-            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            lines = ["<b>📜 History (sesión actual)</b>", ""]
-            for r in rows:
-                dt_utc = datetime.fromisoformat(r["created_at"])
-                ts = f"{dt_utc.day:02d} {months[dt_utc.month - 1]} {dt_utc.year}"
-
-                movement_id = int(r["id"])
-                kind = str(r["kind"] or "")
-                amt_cents = int(r["amount_cents"] or 0)
-                total_after_cents = int(r["total_after_cents"] or 0)
-                actor_id = int(r["actor_id"]) if r["actor_id"] is not None else None
-                actor_name = participant_names.get(actor_id or -1)
-                display_name = None
-                if kind == "add":
-                    label = "Add"
-                    amount_disp = f"${cents_to_money_str(amt_cents)}"
-                    display_name = gmail_payer_by_movement.get(movement_id) or actor_name
-                elif kind == "release":
-                    label = "Release"
-                    amount_disp = f"${cents_to_money_str(amt_cents)}"
-                    display_name = actor_name
-                elif kind == "reversal":
-                    label = "Reversal"
-                    amount_disp = f"-${cents_to_money_str(amt_cents)}"
-                    display_name = reversal_payer_by_movement.get(movement_id) or actor_name
-                else:
-                    label = kind
-                    amount_disp = f"${cents_to_money_str(amt_cents)}"
-                    display_name = actor_name
-                name_suffix = f" &#183; {_html_escape(display_name)}" if display_name else ""
-                lines.append(
-                    f"&#183; <b>{_html_escape(label)}{name_suffix}</b>: <code>{amount_disp}</code> "
-                    f"&#8594; Total: <code>${cents_to_money_str(total_after_cents)}</code>\n"
-                    f"  <i>{ts}</i>"
-                )
-            hist_text = "\n".join(lines)
-
-        await edit_panel(update.effective_chat.id, context, text=hist_text, reply_markup=build_back_keyboard())
-        return
-
-    if data == "back":
-        g = get_global_state()
-        total_cents = g["total_cents"]
-        await edit_panel(
-            update.effective_chat.id,
-            context,
-            text=build_panel_text(total_cents),
-            reply_markup=build_panel_keyboard(update.effective_chat.id),
-        )
-        return
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if data and elapsed_ms >= BUTTON_SLOW_LOG_MS:
+            logger.info(
+                "Button callback slow data=%s user_id=%s chat_id=%s elapsed_ms=%.1f",
+                data,
+                user.id if user else None,
+                chat_id,
+                elapsed_ms,
+            )
 
 
 # =========================
@@ -5491,6 +5668,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_app_init(app: Application):
     global KRAKEN_REFRESH_TASK, GMAIL_ZELLE_TASK
+
+    _maybe_warn_banner_source_setup()
 
     if not KRAKEN_CACHE["enabled"]:
         logger.info("Kraken balance dashboard line enabled in placeholder mode (missing Kraken API creds)")
